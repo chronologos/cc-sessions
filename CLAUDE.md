@@ -1,27 +1,14 @@
 # cc-session
 
-A fast CLI tool to list and resume Claude Code sessions across all projects.
+Agent-focused documentation. See README.md for user-facing docs.
 
-## Build & Install
+## Build & Test
 
 ```bash
 cargo build --release
+cargo test
 cp target/release/cc-session ~/bin/cc-sessions
-# macOS: ad-hoc sign to avoid Gatekeeper killing unsigned binaries
-xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
-```
-
-## Usage
-
-```bash
-cc-sessions              # List 15 most recent sessions
-cc-sessions -c 30        # List 30 sessions
-cc-sessions -i           # Interactive fzf picker with transcript preview
-cc-sessions -f           # Fork a session (creates new session ID)
-cc-sessions -i -f        # Interactive mode + fork
-cc-sessions -p dotfiles  # Filter by project name (case-insensitive substring)
-cc-sessions -p bike -i   # Filter + interactive mode
-cc-sessions --debug      # Show session source (indexed/orphan) and stats
+xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions  # macOS
 ```
 
 ## Architecture
@@ -110,6 +97,8 @@ flowchart LR
     A1 -.-> AM
 ```
 
+## Implementation Details
+
 ### Session Discovery
 - Reads `sessions-index.json` files from `~/.claude/projects/*/`
 - Each index contains session metadata: id, projectPath, firstPrompt, created, modified
@@ -128,15 +117,22 @@ Sessions not yet indexed by Claude Code are discovered by scanning `.jsonl` file
 
 **Debug mode (`--debug`):** Shows session source (indexed vs orphan) and statistics
 
+### Timestamp Handling
+- Index timestamps may be stale if Claude Code hasn't re-indexed
+- Uses `max(index_modified, file_mtime)` for accurate sorting
+- Created time comes from index or file metadata
+
+### Session Names (customTitle)
+- Set via `/rename` command in Claude Code
+- Displayed with `★` prefix: `★ name - summary`
+- Indicates user-marked important sessions
+
 ### Data Source
-Claude Code maintains `sessions-index.json` in each project directory with:
-- `projectPath`: Actual filesystem path (e.g., `/Users/iantay/Documents/repos/bike-power`)
-- `firstPrompt`: First user message (already extracted)
-- `created`/`modified`: ISO 8601 timestamps
+Claude Code maintains `sessions-index.json` in each project directory.
 
-**Fields cc-sessions reads:** sessionId, fullPath, projectPath, firstPrompt, summary, created, modified
+**Fields cc-sessions reads:** sessionId, fullPath, projectPath, firstPrompt, summary, customTitle, created, modified
 
-**Fields cc-sessions ignores:** customTitle, fileMtime, messageCount, gitBranch, isSidechain, version
+**Fields cc-sessions ignores:** fileMtime, messageCount, gitBranch, isSidechain, version
 
 Note: The index may contain stale entries for deleted sessions. We filter these by checking if `fullPath` exists.
 
@@ -155,18 +151,3 @@ Note: The index may contain stale entries for deleted sessions. We filter these 
 
 - **Runtime**: `fzf` and `jaq` (for interactive mode preview)
 - **Build**: Rust 1.85+ (edition 2024), rayon for parallelism
-
-## Output Format
-
-List mode shows relative times and AI-generated summary:
-```
-CREAT  MOD    PROJECT      SUMMARY
-──────────────────────────────────────────────────────────────────────────────────────────
-1h     1h     dotfiles     Shell alias structure refactoring
-2d     3h     bike-power   Bike Power App: Build 10, Landscape Layout
-```
-
-Interactive mode (`-i`):
-- Fuzzy search matches project name, summary, and full transcript metadata
-- Preview pane shows conversation transcript with 👤 user / 🤖 assistant prefixes
-- Use `-f` flag to fork instead of resume (creates new session ID)

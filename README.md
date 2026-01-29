@@ -33,6 +33,7 @@ cc-sessions -i           # Interactive fzf picker with transcript preview
 cc-sessions -f           # Fork a session (creates new session ID)
 cc-sessions -i -f        # Interactive mode + fork
 cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
+cc-sessions --debug      # Show session source (indexed/orphan) and stats
 ```
 
 ### List mode
@@ -40,21 +41,29 @@ cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
 Shows sessions with relative timestamps and AI-generated summaries:
 
 ```
-CREAT  MOD    PROJECT      SUMMARY
+CREAT  MOD    PROJECT          SUMMARY
 ──────────────────────────────────────────────────────────────────────────────────────────
-1h     1h     dotfiles     Shell alias structure refactoring
-2d     3h     bike-power   Bike Power App: Build 10, Landscape Layout
-4h     3h     server       Add support for extracting note media
+1h     1h     dotfiles         Shell alias structure refactoring
+2d     3h     bike-power       Bike Power App: Build 10, Landscape Layout
+4h     3h     cc-session       ★ my-session - Claude Code session improvements
 ```
+
+**Named sessions**: Sessions renamed with `/rename` in Claude Code show a `★` prefix, indicating importance.
 
 ### Interactive mode (`-i`)
 
-![fzf picker](https://github.com/user-attachments/assets/placeholder.png)
-
 - **Fuzzy search** through project names, summaries, and transcript metadata
 - **Preview pane** shows conversation transcript with 👤 user / 🤖 assistant prefixes
+- **Hybrid search**: `ctrl-s` for full-text transcript search, `ctrl-n` for normal filter
 - **Enter** to resume session in the original project directory
 - Use `-f` to fork instead of resume (creates new session ID)
+
+## Features
+
+- **Orphan detection**: Finds sessions not yet indexed by Claude Code (shown as "orphan" in `--debug` mode)
+- **Session names**: Shows `★ name` for sessions renamed with `/rename`
+- **Stale timestamp fix**: Uses file mtime when newer than index timestamp
+- **Parallel processing**: Uses rayon for fast scanning across many projects
 
 ## Requirements
 
@@ -68,9 +77,9 @@ CREAT  MOD    PROJECT      SUMMARY
 Claude Code stores session data in `~/.claude/projects/`. This tool:
 
 1. Reads `sessions-index.json` files from each project directory
-2. Extracts metadata: session ID, project path, summary, timestamps
-3. Filters out stale entries where the session file no longer exists
-4. Uses `rayon` for parallel processing across projects
+2. Discovers orphan `.jsonl` files not yet in the index
+3. Extracts metadata: session ID, project path, summary, timestamps, custom name
+4. Filters out stale entries and empty sessions
 
 When you select a session:
 - **Resume** (`-r`): Continues the existing session
