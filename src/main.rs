@@ -353,3 +353,309 @@ fn format_time_relative(time: SystemTime) -> String {
         format!("{}w", secs / 604800)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // =============================================================================
+    // parse_iso_time - Critical for session sorting
+    // =============================================================================
+
+    #[test]
+    fn parse_iso_time_standard_format() {
+        // Real format from Claude Code sessions-index.json
+        let result = parse_iso_time("2026-01-15T06:15:58.913Z");
+        assert!(result.is_some());
+
+        // Verify it's in the right ballpark (after 2025, before 2027)
+        let secs = result
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let year_2025 = 55 * 365 * 86400; // ~2025
+        let year_2027 = 57 * 365 * 86400; // ~2027
+        assert!(secs > year_2025 && secs < year_2027);
+    }
+
+    #[test]
+    fn parse_iso_time_without_milliseconds() {
+        let result = parse_iso_time("2026-01-15T06:15:58Z");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn parse_iso_time_ordering_preserved() {
+        // Earlier time should produce smaller SystemTime
+        let earlier = parse_iso_time("2026-01-15T06:00:00Z").unwrap();
+        let later = parse_iso_time("2026-01-15T07:00:00Z").unwrap();
+        assert!(earlier < later);
+
+        // Different days
+        let day1 = parse_iso_time("2026-01-15T12:00:00Z").unwrap();
+        let day2 = parse_iso_time("2026-01-16T12:00:00Z").unwrap();
+        assert!(day1 < day2);
+    }
+
+    #[test]
+    fn parse_iso_time_leap_year() {
+        // 2024 is a leap year - Feb 29 should parse
+        let result = parse_iso_time("2024-02-29T12:00:00Z");
+        assert!(result.is_some());
+
+        // March 1 should be one day later
+        let feb29 = parse_iso_time("2024-02-29T12:00:00Z").unwrap();
+        let mar1 = parse_iso_time("2024-03-01T12:00:00Z").unwrap();
+        let diff = mar1.duration_since(feb29).unwrap().as_secs();
+        assert_eq!(diff, 86400); // exactly one day
+    }
+
+    #[test]
+    fn parse_iso_time_invalid_formats() {
+        assert!(parse_iso_time("not a date").is_none());
+        assert!(parse_iso_time("2026-01-15").is_none()); // missing time
+        assert!(parse_iso_time("06:15:58Z").is_none()); // missing date
+        assert!(parse_iso_time("").is_none());
+    }
+
+    // =============================================================================
+    // IndexEntry deserialization - Critical for reading session metadata
+    // =============================================================================
+
+    #[test]
+    fn index_entry_deserialize_full() {
+        let json = r#"{
+            "sessionId": "abc-123",
+            "fullPath": "/home/user/.claude/sessions/abc.jsonl",
+            "firstPrompt": "Hello world",
+            "summary": "Test summary",
+            "created": "2026-01-15T06:00:00Z",
+            "modified": "2026-01-15T07:00:00Z",
+            "projectPath": "/home/user/my-project"
+        }"#;
+
+        let entry: IndexEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.session_id, "abc-123");
+        assert_eq!(entry.full_path, "/home/user/.claude/sessions/abc.jsonl");
+        assert_eq!(entry.first_prompt, Some("Hello world".to_string()));
+        assert_eq!(entry.summary, Some("Test summary".to_string()));
+        assert_eq!(
+            entry.project_path,
+            Some("/home/user/my-project".to_string())
+        );
+    }
+
+    #[test]
+    fn index_entry_deserialize_minimal() {
+        // Only required fields - optional fields missing
+        let json = r#"{
+            "sessionId": "abc-123",
+            "fullPath": "/path/to/session.jsonl"
+        }"#;
+
+        let entry: IndexEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.session_id, "abc-123");
+        assert!(entry.first_prompt.is_none());
+        assert!(entry.summary.is_none());
+        assert!(entry.project_path.is_none());
+    }
+
+    #[test]
+    fn sessions_index_deserialize() {
+        let json = r#"{
+            "entries": [
+                {"sessionId": "sess-1", "fullPath": "/path/1.jsonl"},
+                {"sessionId": "sess-2", "fullPath": "/path/2.jsonl"}
+            ]
+        }"#;
+
+        let index: SessionsIndex = serde_json::from_str(json).unwrap();
+        assert_eq!(index.entries.len(), 2);
+        assert_eq!(index.entries[0].session_id, "sess-1");
+        assert_eq!(index.entries[1].session_id, "sess-2");
+    }
+
+    // =============================================================================
+    // Project name extraction - Used for display and filtering
+    // =============================================================================
+
+    #[test]
+    fn project_name_from_path() {
+        // Simulates the logic in find_sessions
+        let extract =
+            |path: &str| -> String { path.split('/').last().unwrap_or("unknown").to_string() };
+
+        assert_eq!(extract("/Users/foo/my-project"), "my-project");
+        assert_eq!(extract("/home/user/code/bike-power"), "bike-power");
+        assert_eq!(extract("single"), "single");
+        assert_eq!(extract(""), "");
+    }
+
+    // =============================================================================
+    // Project filter logic - The -p flag behavior
+    // =============================================================================
+
+    #[test]
+    fn project_filter_case_insensitive() {
+        let projects = vec![
+            "holy-grail",
+            "Ministry-Of-Silly-Walks",
+            "SPANISH-INQUISITION",
+        ];
+
+        let matches = |filter: &str| -> Vec<&str> {
+            let filter_lower = filter.to_lowercase();
+            projects
+                .iter()
+                .filter(|p| p.to_lowercase().contains(&filter_lower))
+                .copied()
+                .collect()
+        };
+
+        // Nobody expects the Spanish Inquisition (but we can filter for it)
+        assert_eq!(matches("spanish"), vec!["SPANISH-INQUISITION"]);
+        assert_eq!(matches("SILLY"), vec!["Ministry-Of-Silly-Walks"]);
+        assert_eq!(matches("grail"), vec!["holy-grail"]);
+    }
+
+    #[test]
+    fn project_filter_substring() {
+        let projects = vec!["spam", "spam-eggs", "spam-eggs-spam"];
+
+        let matches = |filter: &str| -> Vec<&str> {
+            let filter_lower = filter.to_lowercase();
+            projects
+                .iter()
+                .filter(|p| p.to_lowercase().contains(&filter_lower))
+                .copied()
+                .collect()
+        };
+
+        // Spam, spam, spam, spam...
+        assert_eq!(matches("spam"), vec!["spam", "spam-eggs", "spam-eggs-spam"]);
+        // Eggs are less common
+        assert_eq!(matches("eggs"), vec!["spam-eggs", "spam-eggs-spam"]);
+    }
+
+    // =============================================================================
+    // Integration test with fake session data
+    // =============================================================================
+
+    #[test]
+    fn find_sessions_with_fake_data() {
+        // Create temp directory structure mimicking ~/.claude/projects/
+        let temp_dir = std::env::temp_dir().join(format!("cc-session-test-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-sirrobin-holy-grail");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        // Create fake session files
+        let session1_path = project_dir.join("black-knight.jsonl");
+        let session2_path = project_dir.join("killer-rabbit.jsonl");
+        fs::write(
+            &session1_path,
+            r#"{"type":"user","message":"Tis but a scratch"}"#,
+        )
+        .unwrap();
+        fs::write(&session2_path, r#"{"type":"user","message":"Run away!"}"#).unwrap();
+
+        // Create sessions-index.json with two sessions
+        let index_json = format!(
+            r#"{{
+                "entries": [
+                    {{
+                        "sessionId": "black-knight-battle",
+                        "fullPath": "{}",
+                        "projectPath": "/Users/sirrobin/holy-grail",
+                        "summary": "Losing limbs but staying positive",
+                        "created": "1975-04-03T10:00:00Z",
+                        "modified": "1975-04-03T11:00:00Z"
+                    }},
+                    {{
+                        "sessionId": "killer-rabbit-encounter",
+                        "fullPath": "{}",
+                        "projectPath": "/Users/sirrobin/holy-grail",
+                        "summary": "Deploying Holy Hand Grenade of Antioch",
+                        "created": "1975-04-03T14:00:00Z",
+                        "modified": "1975-04-03T15:00:00Z"
+                    }}
+                ]
+            }}"#,
+            session1_path.display(),
+            session2_path.display()
+        );
+        fs::write(project_dir.join("sessions-index.json"), index_json).unwrap();
+
+        // Run find_sessions
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // Verify results
+        assert_eq!(sessions.len(), 2);
+
+        // Should be sorted by modified time (newest first)
+        assert_eq!(sessions[0].id, "killer-rabbit-encounter");
+        assert_eq!(sessions[1].id, "black-knight-battle");
+
+        // Verify project name extraction
+        assert_eq!(sessions[0].project, "holy-grail");
+
+        // Verify summary is preserved
+        assert_eq!(
+            sessions[0].summary,
+            Some("Deploying Holy Hand Grenade of Antioch".to_string())
+        );
+
+        // Cleanup
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_filters_missing_files() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-parrot-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-shopkeeper-ministry-of-silly-walks");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        // The parrot exists (it's just resting)
+        let resting_parrot = project_dir.join("norwegian-blue.jsonl");
+        fs::write(
+            &resting_parrot,
+            r#"{"type":"user","message":"Beautiful plumage!"}"#,
+        )
+        .unwrap();
+
+        // But the ex-parrot has ceased to be
+        let index_json = format!(
+            r#"{{
+                "entries": [
+                    {{
+                        "sessionId": "resting-parrot",
+                        "fullPath": "{}",
+                        "projectPath": "/Users/shopkeeper/ministry-of-silly-walks",
+                        "summary": "Pining for the fjords"
+                    }},
+                    {{
+                        "sessionId": "ex-parrot",
+                        "fullPath": "/nonexistent/this/parrot/has/ceased/to/be.jsonl",
+                        "projectPath": "/Users/shopkeeper/ministry-of-silly-walks",
+                        "summary": "Has joined the choir invisible"
+                    }}
+                ]
+            }}"#,
+            resting_parrot.display()
+        );
+        fs::write(project_dir.join("sessions-index.json"), index_json).unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // Only the resting parrot should be found (the ex-parrot is no more)
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "resting-parrot");
+        assert_eq!(
+            sessions[0].summary,
+            Some("Pining for the fjords".to_string())
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+}
