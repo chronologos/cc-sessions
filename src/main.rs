@@ -21,6 +21,10 @@ struct Args {
     /// Fork session instead of resuming (creates new session ID)
     #[arg(short, long)]
     fork: bool,
+
+    /// Filter by project name (substring match, case-insensitive)
+    #[arg(short, long)]
+    project: Option<String>,
 }
 
 #[derive(Debug)]
@@ -215,7 +219,20 @@ fn main() -> Result<()> {
         anyhow::bail!("No Claude sessions found at {:?}", projects_dir);
     }
 
-    let sessions = find_sessions(&projects_dir)?;
+    let mut sessions = find_sessions(&projects_dir)?;
+
+    // Filter by project name if specified
+    if let Some(ref filter) = args.project {
+        let filter_lower = filter.to_lowercase();
+        sessions.retain(|s| s.project.to_lowercase().contains(&filter_lower));
+    }
+
+    if sessions.is_empty() {
+        if args.project.is_some() {
+            anyhow::bail!("No sessions found matching project filter");
+        }
+        anyhow::bail!("No sessions found");
+    }
 
     if args.interactive || args.fork {
         interactive_mode(&sessions, args.fork)?;

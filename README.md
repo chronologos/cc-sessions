@@ -27,11 +27,12 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 ## Usage
 
 ```bash
-cc-sessions           # List 15 most recent sessions
-cc-sessions -c 30     # List 30 sessions
-cc-sessions -i        # Interactive fzf picker with transcript preview
-cc-sessions -f        # Fork a session (creates new session ID)
-cc-sessions -i -f     # Interactive mode + fork
+cc-sessions              # List 15 most recent sessions
+cc-sessions -c 30        # List 30 sessions
+cc-sessions -i           # Interactive fzf picker with transcript preview
+cc-sessions -f           # Fork a session (creates new session ID)
+cc-sessions -i -f        # Interactive mode + fork
+cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
 ```
 
 ### List mode
