@@ -25,6 +25,90 @@ cc-sessions -p bike -i   # Filter + interactive mode
 
 ## Architecture
 
+### Session Storage Structure
+
+```mermaid
+graph TB
+    subgraph "~/.claude/"
+        H[history.jsonl<br/><i>prompt history</i>]
+        subgraph "projects/"
+            subgraph "-Users-you-project-a/"
+                IA[sessions-index.json]
+                S1[abc123.jsonl]
+                S2[def456.jsonl]
+            end
+            subgraph "-Users-you-project-b/"
+                IB[sessions-index.json]
+                S3[ghi789.jsonl]
+            end
+        end
+    end
+
+    IA -->|fullPath| S1
+    IA -->|fullPath| S2
+    IB -->|fullPath| S3
+
+    style IA fill:#f9f,stroke:#333
+    style IB fill:#f9f,stroke:#333
+    style S1 fill:#bbf,stroke:#333
+    style S2 fill:#bbf,stroke:#333
+    style S3 fill:#bbf,stroke:#333
+```
+
+### sessions-index.json Format
+
+```mermaid
+classDiagram
+    class SessionsIndex {
+        version: 1
+        entries: IndexEntry[]
+    }
+    class IndexEntry {
+        sessionId: string
+        fullPath: string
+        projectPath: string
+        firstPrompt: string
+        summary: string?
+        customTitle: string?
+        created: ISO8601
+        modified: ISO8601
+        fileMtime: epoch_ms
+        messageCount: number
+        gitBranch: string
+        isSidechain: boolean
+    }
+    SessionsIndex "1" *-- "*" IndexEntry
+
+    style IndexEntry fill:#f9f
+```
+
+### Session JSONL Message Types
+
+```mermaid
+flowchart LR
+    subgraph "Session .jsonl file"
+        direction TB
+        U1[user] --> A1[assistant]
+        A1 --> U2[user]
+        U2 --> A2[assistant]
+    end
+
+    subgraph "Message Content"
+        direction TB
+        UM["user.message.content<br/>─────────────────<br/>string | ContentBlock[]"]
+        AM["assistant.message.content[]<br/>─────────────────<br/>• type: text<br/>• type: thinking<br/>• type: tool_use"]
+    end
+
+    subgraph "Other Entry Types"
+        SUM[summary]
+        SYS[system]
+        FHS[file-history-snapshot]
+    end
+
+    U1 -.-> UM
+    A1 -.-> AM
+```
+
 ### Session Discovery
 - Reads `sessions-index.json` files from `~/.claude/projects/*/`
 - Each index contains session metadata: id, projectPath, firstPrompt, created, modified
@@ -37,12 +121,22 @@ Claude Code maintains `sessions-index.json` in each project directory with:
 - `firstPrompt`: First user message (already extracted)
 - `created`/`modified`: ISO 8601 timestamps
 
+**Fields cc-sessions reads:** sessionId, fullPath, projectPath, firstPrompt, summary, created, modified
+
+**Fields cc-sessions ignores:** customTitle, fileMtime, messageCount, gitBranch, isSidechain, version
+
 Note: The index may contain stale entries for deleted sessions. We filter these by checking if `fullPath` exists.
 
 ### Interactive Mode
 - Pipes session list to fzf with tab-delimited fields
 - Preview runs `jaq` to extract conversation transcript from `.jsonl` files
 - On selection, spawns `zsh -c "cd <project> && claude -r <session-id>"`
+
+**Hybrid Search (ctrl-s / ctrl-n):**
+- `ctrl-s`: Switch to **search mode** - full-text search across all session transcripts using ripgrep
+- `ctrl-n`: Switch to **normal mode** - fuzzy filter by project name and summary
+- In search mode, preview shows matching context with highlighting
+- Search is live - results update as you type (~100-200ms latency)
 
 ## Dependencies
 

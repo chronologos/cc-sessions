@@ -248,6 +248,8 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let claude_dir = get_claude_projects_dir()?;
+
     let input: String = sessions
         .iter()
         .map(|s| {
@@ -277,14 +279,82 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Write session list to temp file for reload
+    let temp_file = std::env::temp_dir().join(format!("cc-sessions-{}.txt", std::process::id()));
+    fs::write(&temp_file, &input)?;
+
     // Preview: extract filepath from field 1, run jaq to show transcript
-    let preview_cmd = r#"f=$(echo {} | cut -f1); [ -f "$f" ] && jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -100 || echo "No preview""#;
+    // In search mode, highlight matching terms
+    let preview_cmd = r#"f=$(echo {} | cut -f1); q="$FZF_QUERY"; [ -f "$f" ] && { if [ -n "$q" ] && [ "$FZF_PROMPT" = "search> " ]; then rg --color=always -C1 "$q" "$f" 2>/dev/null | head -80 || echo "No matches"; else jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -100; fi; } || echo "No preview""#;
 
     let header = if fork {
-        "FORK MODE - CREAT MOD   PROJECT      SUMMARY"
+        "FORK │ ctrl-s: search transcripts │ ctrl-n: normal"
     } else {
-        "CREAT  MOD    PROJECT      SUMMARY"
+        "ctrl-s: search transcripts │ ctrl-n: normal │ CREAT MOD PROJECT"
     };
+
+    // Write search script to temp file for easier invocation
+    let search_script_file =
+        std::env::temp_dir().join(format!("cc-sessions-search-{}.sh", std::process::id()));
+    fs::write(
+        &search_script_file,
+        format!(
+            r#"#!/bin/bash
+q="$1"
+[ -z "$q" ] && cat "{temp}" && exit
+
+# Helper to convert ISO date to relative time
+reltime() {{
+    local iso="$1"
+    [ -z "$iso" ] && echo "?" && return
+    local ts=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${{iso%%.*}}" +%s 2>/dev/null || echo 0)
+    local now=$(date +%s)
+    local diff=$((now - ts))
+    if [ $diff -lt 60 ]; then echo "now"
+    elif [ $diff -lt 3600 ]; then echo "$((diff/60))m"
+    elif [ $diff -lt 86400 ]; then echo "$((diff/3600))h"
+    elif [ $diff -lt 604800 ]; then echo "$((diff/86400))d"
+    else echo "$((diff/604800))w"
+    fi
+}}
+
+rg -l "$q" "{claude}" --glob "*.jsonl" 2>/dev/null | while read -r f; do
+    d=$(dirname "$f")
+    [[ "$d" == *"/subagents" ]] && continue
+    id=$(basename "$f" .jsonl)
+    idx="$d/sessions-index.json"
+    [ -f "$idx" ] && jaq -r --arg id "$id" '
+        .entries[] | select(.sessionId == $id) |
+        [.fullPath, .sessionId, .projectPath // "", .summary // .firstPrompt // "",
+         (.projectPath // "" | split("/") | .[-1] // "unknown"), .created // "", .modified // ""] | @tsv
+    ' "$idx" 2>/dev/null | head -1 | while IFS=$'\t' read fp sid pp sum proj cre mod; do
+        ct=$(reltime "$cre")
+        mt=$(reltime "$mod")
+        printf "%s\t%s\t%s\t%s\t%-6s %-6s %-12s %s\n" "$fp" "$sid" "$pp" "$sum" "$ct" "$mt" "$proj" "$sum"
+    done
+done | head -50
+"#,
+            temp = temp_file.display(),
+            claude = claude_dir.display()
+        ),
+    )?;
+
+    // Keybindings for mode switching:
+    // ctrl-s: switch to search mode (disable fzf filtering, reload via rg on each change)
+    // ctrl-n: switch to normal mode (enable fzf filtering, reload original list)
+    let bind_search = format!(
+        "ctrl-s:disable-search+change-prompt(search> )+reload(bash {} {{q}})",
+        search_script_file.display()
+    );
+    let bind_normal = format!(
+        "ctrl-n:enable-search+change-prompt(filter> )+reload(cat {})+clear-query",
+        temp_file.display()
+    );
+    // In search mode (disabled), reload on every keystroke
+    let bind_change = format!(
+        "change:reload:bash {} {{q}}",
+        search_script_file.display()
+    );
 
     let mut fzf = Command::new("fzf")
         .args([
@@ -294,7 +364,15 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
             preview_cmd,
             "--preview-window=right:50%:wrap",
             &format!("--header={}", header),
+            "--prompt=filter> ",
             "--no-hscroll",
+            "--ansi",
+            "--bind",
+            &bind_search,
+            "--bind",
+            &bind_normal,
+            "--bind",
+            &bind_change,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -306,6 +384,10 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     }
 
     let output = fzf.wait_with_output()?;
+
+    // Clean up temp files
+    let _ = fs::remove_file(&temp_file);
+    let _ = fs::remove_file(&search_script_file);
 
     if output.status.success() {
         let selected = String::from_utf8_lossy(&output.stdout);
