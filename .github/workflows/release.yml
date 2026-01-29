@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from Cargo.toml
+        id: check
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Check if tag already exists
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version v$VERSION detected"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: cc-sessions-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            name: cc-sessions-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/cc-session ${{ matrix.name }}
+
+      - name: Generate SHA256
+        run: |
+          shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  release:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir release
+          cp artifacts/*/* release/
+          cd release
+          cat *.sha256 > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
+          body: |
+            ## cc-sessions v${{ needs.check-version.outputs.version }}
+
+            ### Installation
+
+            ```bash
+            # macOS ARM64 (Apple Silicon)
+            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}/cc-sessions-macos-arm64 -o ~/bin/cc-sessions
+
+            # macOS x86_64 (Intel)
+            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}/cc-sessions-macos-x86_64 -o ~/bin/cc-sessions
+
+            # Then:
+            chmod +x ~/bin/cc-sessions
+            xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
+            ```
+
+            ### Verify checksum
+
+            ```bash
+            shasum -a 256 ~/bin/cc-sessions
+            # Compare with checksums.sha256 below
+            ```
+
+            ### Requirements
+            - `fzf` and `jaq` for interactive mode: `brew install fzf jaq`
+          files: |
+            release/cc-sessions-macos-arm64
+            release/cc-sessions-macos-x86_64
+            release/checksums.sha256
