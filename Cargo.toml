@@ -12,6 +12,9 @@ walkdir = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
 
 [profile.release]
 lto = true

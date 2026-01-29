@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use grep_regex::RegexMatcher;
+use grep_searcher::Searcher;
+use grep_searcher::sinks::UTF8;
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::fs;
@@ -25,6 +28,10 @@ struct Args {
     /// Filter by project name (substring match, case-insensitive)
     #[arg(short, long)]
     project: Option<String>,
+
+    /// Search transcript contents (used internally by interactive mode)
+    #[arg(short, long)]
+    search: Option<String>,
 }
 
 #[derive(Debug)]
@@ -220,6 +227,19 @@ fn main() -> Result<()> {
         anyhow::bail!("No Claude sessions found at {:?}", projects_dir);
     }
 
+    // Search mode: find sessions matching pattern and output for fzf
+    if let Some(ref pattern) = args.search {
+        if pattern.is_empty() {
+            // Empty pattern: return all sessions in fzf format
+            let sessions = find_sessions(&projects_dir)?;
+            print_sessions_fzf(&sessions);
+        } else {
+            let sessions = search_sessions(&projects_dir, pattern)?;
+            print_sessions_fzf(&sessions);
+        }
+        return Ok(());
+    }
+
     let mut sessions = find_sessions(&projects_dir)?;
 
     // Filter by project name if specified
@@ -244,47 +264,116 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Search session transcripts for a pattern using grep crates
+fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
+    let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
+
+    // Find all .jsonl files
+    let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().is_some_and(|ext| ext == "jsonl")
+                && !e.path().to_string_lossy().contains("/subagents/")
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect();
+
+    // Search files in parallel
+    let matching_files: Vec<PathBuf> = jsonl_files
+        .par_iter()
+        .filter(|path| {
+            let mut found = false;
+            let _ = Searcher::new().search_path(
+                &matcher,
+                path,
+                UTF8(|_, _| {
+                    found = true;
+                    Ok(false) // Stop after first match
+                }),
+            );
+            found
+        })
+        .cloned()
+        .collect();
+
+    // Load session metadata for matching files
+    let sessions: Vec<Session> = matching_files
+        .par_iter()
+        .filter_map(|filepath| {
+            let session_id = filepath.file_stem()?.to_string_lossy().to_string();
+            let index_path = filepath.parent()?.join("sessions-index.json");
+            let content = fs::read_to_string(&index_path).ok()?;
+            let index: SessionsIndex = serde_json::from_str(&content).ok()?;
+
+            index.entries.into_iter().find_map(|entry| {
+                if entry.session_id != session_id {
+                    return None;
+                }
+
+                let project_path = entry.project_path.unwrap_or_default();
+                let project = project_path
+                    .split('/')
+                    .last()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let created = entry
+                    .created
+                    .as_deref()
+                    .and_then(parse_iso_time)
+                    .unwrap_or(UNIX_EPOCH);
+                let modified = entry
+                    .modified
+                    .as_deref()
+                    .and_then(parse_iso_time)
+                    .unwrap_or(UNIX_EPOCH);
+
+                Some(Session {
+                    id: entry.session_id,
+                    project,
+                    project_path,
+                    filepath: filepath.clone(),
+                    created,
+                    modified,
+                    first_message: entry.first_prompt,
+                    summary: entry.summary,
+                })
+            })
+        })
+        .collect();
+
+    let mut sessions = sessions;
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(sessions)
+}
+
+/// Print sessions in fzf-compatible tab-delimited format
+fn print_sessions_fzf(sessions: &[Session]) {
+    for s in sessions.iter().take(50) {
+        println!("{}", format_session_fzf(s));
+    }
+}
+
 fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let claude_dir = get_claude_projects_dir()?;
+    // Get path to current executable for search reload
+    let exe_path = std::env::current_exe().context("Could not get executable path")?;
 
     let input: String = sessions
         .iter()
-        .map(|s| {
-            let modified = format_time_relative(s.modified);
-            let created = format_time_relative(s.created);
-            let summary: String = s
-                .summary
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .take(50)
-                .collect();
-            // Fields: filepath, session_id, project_path, summary (searchable), display
-            // fzf searches all fields but only displays field 5+
-            format!(
-                "{}\t{}\t{}\t{}\t{:<6} {:<6} {:<12} {}",
-                s.filepath.display(),
-                s.id,
-                s.project_path,
-                s.summary.as_deref().unwrap_or(""), // full summary for search
-                created,
-                modified,
-                s.project,
-                summary
-            )
-        })
+        .map(|s| format_session_fzf(s))
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Write session list to temp file for reload
+    // Write session list to temp file for reload back to normal mode
     let temp_file = std::env::temp_dir().join(format!("cc-sessions-{}.txt", std::process::id()));
     fs::write(&temp_file, &input)?;
 
-    // Preview: extract filepath from field 1, run jaq to show transcript
-    // In search mode, highlight matching terms
+    // Preview: in search mode show rg matches, otherwise show transcript
     let preview_cmd = r#"f=$(echo {} | cut -f1); q="$FZF_QUERY"; [ -f "$f" ] && { if [ -n "$q" ] && [ "$FZF_PROMPT" = "search> " ]; then rg --color=always -C1 "$q" "$f" 2>/dev/null | head -80 || echo "No matches"; else jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -100; fi; } || echo "No preview""#;
 
     let header = if fork {
@@ -293,68 +382,16 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
         "ctrl-s: search transcripts │ ctrl-n: normal │ CREAT MOD PROJECT"
     };
 
-    // Write search script to temp file for easier invocation
-    let search_script_file =
-        std::env::temp_dir().join(format!("cc-sessions-search-{}.sh", std::process::id()));
-    fs::write(
-        &search_script_file,
-        format!(
-            r#"#!/bin/bash
-q="$1"
-[ -z "$q" ] && cat "{temp}" && exit
-
-# Helper to convert ISO date to relative time
-reltime() {{
-    local iso="$1"
-    [ -z "$iso" ] && echo "?" && return
-    local ts=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${{iso%%.*}}" +%s 2>/dev/null || echo 0)
-    local now=$(date +%s)
-    local diff=$((now - ts))
-    if [ $diff -lt 60 ]; then echo "now"
-    elif [ $diff -lt 3600 ]; then echo "$((diff/60))m"
-    elif [ $diff -lt 86400 ]; then echo "$((diff/3600))h"
-    elif [ $diff -lt 604800 ]; then echo "$((diff/86400))d"
-    else echo "$((diff/604800))w"
-    fi
-}}
-
-rg -l "$q" "{claude}" --glob "*.jsonl" 2>/dev/null | while read -r f; do
-    d=$(dirname "$f")
-    [[ "$d" == *"/subagents" ]] && continue
-    id=$(basename "$f" .jsonl)
-    idx="$d/sessions-index.json"
-    [ -f "$idx" ] && jaq -r --arg id "$id" '
-        .entries[] | select(.sessionId == $id) |
-        [.fullPath, .sessionId, .projectPath // "", .summary // .firstPrompt // "",
-         (.projectPath // "" | split("/") | .[-1] // "unknown"), .created // "", .modified // ""] | @tsv
-    ' "$idx" 2>/dev/null | head -1 | while IFS=$'\t' read fp sid pp sum proj cre mod; do
-        ct=$(reltime "$cre")
-        mt=$(reltime "$mod")
-        printf "%s\t%s\t%s\t%s\t%-6s %-6s %-12s %s\n" "$fp" "$sid" "$pp" "$sum" "$ct" "$mt" "$proj" "$sum"
-    done
-done | head -50
-"#,
-            temp = temp_file.display(),
-            claude = claude_dir.display()
-        ),
-    )?;
-
-    // Keybindings for mode switching:
-    // ctrl-s: switch to search mode (disable fzf filtering, reload via rg on each change)
-    // ctrl-n: switch to normal mode (enable fzf filtering, reload original list)
+    // Keybindings: ctrl-s enables search mode, ctrl-n returns to filter mode
     let bind_search = format!(
-        "ctrl-s:disable-search+change-prompt(search> )+reload(bash {} {{q}})",
-        search_script_file.display()
+        "ctrl-s:disable-search+change-prompt(search> )+reload({} --search {{q}})",
+        exe_path.display()
     );
     let bind_normal = format!(
         "ctrl-n:enable-search+change-prompt(filter> )+reload(cat {})+clear-query",
         temp_file.display()
     );
-    // In search mode (disabled), reload on every keystroke
-    let bind_change = format!(
-        "change:reload:bash {} {{q}}",
-        search_script_file.display()
-    );
+    let bind_change = format!("change:reload:{} --search {{q}}", exe_path.display());
 
     let mut fzf = Command::new("fzf")
         .args([
@@ -385,9 +422,8 @@ done | head -50
 
     let output = fzf.wait_with_output()?;
 
-    // Clean up temp files
+    // Clean up temp file
     let _ = fs::remove_file(&temp_file);
-    let _ = fs::remove_file(&search_script_file);
 
     if output.status.success() {
         let selected = String::from_utf8_lossy(&output.stdout);
@@ -417,6 +453,30 @@ done | head -50
     }
 
     Ok(())
+}
+
+/// Format a single session for fzf (tab-delimited)
+fn format_session_fzf(s: &Session) -> String {
+    let modified = format_time_relative(s.modified);
+    let created = format_time_relative(s.created);
+    let summary: String = s
+        .summary
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .take(50)
+        .collect();
+    format!(
+        "{}\t{}\t{}\t{}\t{:<6} {:<6} {:<12} {}",
+        s.filepath.display(),
+        s.id,
+        s.project_path,
+        s.summary.as_deref().unwrap_or(""),
+        created,
+        modified,
+        s.project,
+        summary
+    )
 }
 
 fn format_time_relative(time: SystemTime) -> String {
@@ -761,7 +821,11 @@ mod tests {
 
         // Good index in another project
         let quest_path = good_dir.join("quest.jsonl");
-        fs::write(&quest_path, r#"{"type":"user","message":"What is your quest?"}"#).unwrap();
+        fs::write(
+            &quest_path,
+            r#"{"type":"user","message":"What is your quest?"}"#,
+        )
+        .unwrap();
         let good_index = format!(
             r#"{{
                 "entries": [{{
@@ -792,11 +856,7 @@ mod tests {
         fs::create_dir_all(&bridge_dir).unwrap();
 
         // Valid JSON but empty entries array
-        fs::write(
-            bridge_dir.join("sessions-index.json"),
-            r#"{"entries": []}"#,
-        )
-        .unwrap();
+        fs::write(bridge_dir.join("sessions-index.json"), r#"{"entries": []}"#).unwrap();
 
         let sessions = find_sessions(&temp_dir).unwrap();
         assert_eq!(sessions.len(), 0);
