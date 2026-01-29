@@ -698,13 +698,7 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 fn format_session_fzf(s: &Session) -> String {
     let modified = format_time_relative(s.modified);
     let created = format_time_relative(s.created);
-    let summary: String = s
-        .summary
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(50)
-        .collect();
+    let desc = format_session_desc(s, 50);
     format!(
         "{}\t{}\t{}\t{}\t{:<6} {:<6} {:<12} {}",
         s.filepath.display(),
@@ -714,7 +708,7 @@ fn format_session_fzf(s: &Session) -> String {
         created,
         modified,
         s.project,
-        summary
+        desc
     )
 }
 
