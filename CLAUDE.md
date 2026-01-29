@@ -21,6 +21,7 @@ cc-sessions -f           # Fork a session (creates new session ID)
 cc-sessions -i -f        # Interactive mode + fork
 cc-sessions -p dotfiles  # Filter by project name (case-insensitive substring)
 cc-sessions -p bike -i   # Filter + interactive mode
+cc-sessions --debug      # Show session source (indexed/orphan) and stats
 ```
 
 ## Architecture
@@ -114,6 +115,18 @@ flowchart LR
 - Each index contains session metadata: id, projectPath, firstPrompt, created, modified
 - Filters out sessions where the `.jsonl` file no longer exists
 - Uses `rayon` for parallel processing of index files
+
+### Orphan Detection
+Sessions not yet indexed by Claude Code are discovered by scanning `.jsonl` files:
+- Compares indexed session IDs with actual `.jsonl` files in each project directory
+- Extracts metadata directly from orphan files: `cwd` (project path), first user message, summary
+- Filters out:
+  - `agent-*` files (subagent sessions spawned by Task tool)
+  - Empty sessions (only `file-history-snapshot` entries, no user content)
+  - XML-tagged system content in first message (`<command-message>`, `<local-command-caveat>`)
+- Falls back to parsing directory name for project when `cwd` unavailable
+
+**Debug mode (`--debug`):** Shows session source (indexed vs orphan) and statistics
 
 ### Data Source
 Claude Code maintains `sessions-index.json` in each project directory with:

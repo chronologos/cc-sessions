@@ -32,11 +32,22 @@ struct Args {
     /// Search transcript contents (used internally by interactive mode)
     #[arg(short, long)]
     search: Option<String>,
+
+    /// Debug mode - show where sessions come from
+    #[arg(long)]
+    debug: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SessionSource {
+    Indexed,
+    Orphan,
 }
 
 #[derive(Debug)]
 struct Session {
     id: String,
+    source: SessionSource,
     project: String,
     project_path: String,
     filepath: PathBuf,
@@ -124,6 +135,9 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
         .map(|e| e.path().to_path_buf())
         .collect();
 
+    // Track indexed session IDs to find orphans later
+    let mut indexed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Process in parallel with rayon
     let sessions: Vec<Session> = index_files
         .par_iter()
@@ -170,6 +184,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
 
                         Some(Session {
                             id: entry.session_id,
+                            source: SessionSource::Indexed,
                             project,
                             project_path,
                             filepath,
@@ -185,38 +200,244 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
         .flatten()
         .collect();
 
+    // Collect indexed IDs
+    for s in &sessions {
+        indexed_ids.insert(s.id.clone());
+    }
+
+    // Find orphaned .jsonl files (not in any index)
+    let orphaned_sessions: Vec<Session> = WalkDir::new(projects_dir)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().is_some_and(|ext| ext == "jsonl")
+                && !e.path().to_string_lossy().contains("/subagents/")
+        })
+        .filter_map(|e| {
+            let filepath = e.path().to_path_buf();
+            let id = filepath.file_stem()?.to_string_lossy().to_string();
+
+            // Skip if already indexed
+            if indexed_ids.contains(&id) {
+                return None;
+            }
+
+            // Skip agent-* files (subagent sessions)
+            if id.starts_with("agent-") {
+                return None;
+            }
+
+            // Extract metadata from file, passing parent directory for fallback project name
+            let parent_dir = filepath.parent()?.file_name()?.to_string_lossy().to_string();
+            session_from_orphan_file(&filepath, &parent_dir)
+        })
+        .collect();
+
     let mut sessions = sessions;
+    sessions.extend(orphaned_sessions);
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
 }
 
-fn print_sessions(sessions: &[Session], count: usize) {
-    println!(
-        "{:<6} {:<6} {:<12} {}",
-        "CREAT", "MOD", "PROJECT", "SUMMARY"
-    );
-    println!("{}", "─".repeat(90));
+/// Create a Session from an orphaned .jsonl file (no index entry)
+/// parent_dir_name is used as fallback if cwd cannot be extracted (e.g., "-Users-iantay-meditations")
+fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option<Session> {
+    let id = filepath.file_stem()?.to_string_lossy().to_string();
 
-    for session in sessions.iter().take(count) {
-        let created = format_time_relative(session.created);
-        let modified = format_time_relative(session.modified);
-        // Prefer summary, fall back to first_message
-        let desc = session
-            .summary
-            .as_deref()
-            .or(session.first_message.as_deref())
-            .unwrap_or("");
-        // Truncate to fit terminal
-        let desc: String = desc.chars().take(60).collect();
+    // Get timestamps from file metadata
+    let metadata = fs::metadata(filepath).ok()?;
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    let created = metadata.created().unwrap_or(modified);
 
-        println!(
-            "{:<6} {:<6} {:<12} {}",
-            created, modified, session.project, desc
-        );
+    // Extract project path, first prompt, and summary from file content
+    let (project_path, first_message, summary) = extract_orphan_metadata(filepath);
+
+    // Skip "empty" sessions that have no user content (e.g., only file-history-snapshot entries)
+    if project_path.is_empty() && first_message.is_none() && summary.is_none() {
+        return None;
     }
 
-    println!("{}", "─".repeat(90));
-    println!("Use 'cc-sessions -i' for interactive picker, -f to fork");
+    // Derive project name from cwd, or fall back to parsing directory name
+    let project = if !project_path.is_empty() {
+        project_path
+            .split('/')
+            .last()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        // Parse directory name like "-Users-iantay-Documents-repos-bike-power" -> "bike-power"
+        // Strategy: strip known prefixes to get the actual project name
+        let stripped = parent_dir_name
+            .strip_prefix("-Users-iantay-")
+            .or_else(|| parent_dir_name.strip_prefix("-Users-"))
+            .unwrap_or(parent_dir_name);
+
+        // Remove common path prefixes (Documents-repos-, etc.)
+        stripped
+            .strip_prefix("Documents-repos-")
+            .or_else(|| stripped.strip_prefix("Documents-"))
+            .or_else(|| stripped.strip_prefix("repos-"))
+            .or_else(|| stripped.strip_prefix("third-party-repos-"))
+            .unwrap_or(stripped)
+            .to_string()
+    };
+
+    Some(Session {
+        id,
+        source: SessionSource::Orphan,
+        project,
+        project_path,
+        filepath: filepath.clone(),
+        created,
+        modified,
+        first_message,
+        summary,
+    })
+}
+
+/// Extract project path (from cwd field), first prompt, and summary from a session file
+/// Returns (project_path, first_message, summary)
+fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Option<String>) {
+    use std::io::{BufRead, BufReader};
+
+    let mut project_path = String::new();
+    let mut first_prompt = None;
+    let mut summary = None;
+
+    let file = match fs::File::open(filepath) {
+        Ok(f) => f,
+        Err(_) => return (project_path, first_prompt, summary),
+    };
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().take(50) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
+            let entry_type = entry.get("type").and_then(|v| v.as_str());
+
+            // Extract cwd (project path) from any message with it
+            if project_path.is_empty() {
+                if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
+                    project_path = cwd.to_string();
+                }
+            }
+
+            // Extract summary from compacted sessions
+            if summary.is_none() && entry_type == Some("summary") {
+                if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
+                    summary = Some(s.to_string());
+                }
+            }
+
+            // Extract first user prompt
+            if first_prompt.is_none() && entry_type == Some("user") {
+                if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
+                    let text = if content.is_string() {
+                        content.as_str().map(|s| s.to_string())
+                    } else if content.is_array() {
+                        content.as_array().and_then(|arr| {
+                            arr.iter()
+                                .filter_map(|c| {
+                                    if c.get("type")?.as_str()? == "text" {
+                                        c.get("text")?.as_str().map(|s| s.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .next()
+                        })
+                    } else {
+                        None
+                    };
+
+                    if let Some(t) = text {
+                        // Filter out system prompts and XML-tagged content
+                        if !t.starts_with('/')
+                            && !t.starts_with("[Request")
+                            && !t.starts_with('<')
+                        {
+                            first_prompt = Some(t.chars().take(50).collect());
+                        }
+                    }
+                }
+            }
+
+            // Stop early if we have all we need
+            if !project_path.is_empty() && (first_prompt.is_some() || summary.is_some()) {
+                break;
+            }
+        }
+    }
+
+    (project_path, first_prompt, summary)
+}
+
+fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
+    if debug {
+        println!(
+            "{:<6} {:<6} {:<8} {:<12} {}",
+            "CREAT", "MOD", "SOURCE", "PROJECT", "SUMMARY"
+        );
+        println!("{}", "─".repeat(100));
+
+        for session in sessions.iter().take(count) {
+            let created = format_time_relative(session.created);
+            let modified = format_time_relative(session.modified);
+            let source = match session.source {
+                SessionSource::Indexed => "index",
+                SessionSource::Orphan => "orphan",
+            };
+            let desc = session
+                .summary
+                .as_deref()
+                .or(session.first_message.as_deref())
+                .unwrap_or("");
+            let desc: String = desc.chars().take(50).collect();
+
+            println!(
+                "{:<6} {:<6} {:<8} {:<12} {}",
+                created, modified, source, session.project, desc
+            );
+        }
+
+        // Show stats
+        let indexed = sessions.iter().filter(|s| s.source == SessionSource::Indexed).count();
+        let orphans = sessions.iter().filter(|s| s.source == SessionSource::Orphan).count();
+        println!("{}", "─".repeat(100));
+        println!("Total: {} (indexed: {}, orphans: {})", sessions.len(), indexed, orphans);
+    } else {
+        println!(
+            "{:<6} {:<6} {:<12} {}",
+            "CREAT", "MOD", "PROJECT", "SUMMARY"
+        );
+        println!("{}", "─".repeat(90));
+
+        for session in sessions.iter().take(count) {
+            let created = format_time_relative(session.created);
+            let modified = format_time_relative(session.modified);
+            let desc = session
+                .summary
+                .as_deref()
+                .or(session.first_message.as_deref())
+                .unwrap_or("");
+            let desc: String = desc.chars().take(60).collect();
+
+            println!(
+                "{:<6} {:<6} {:<12} {}",
+                created, modified, session.project, desc
+            );
+        }
+
+        println!("{}", "─".repeat(90));
+        println!("Use 'cc-sessions -i' for interactive picker, -f to fork");
+    }
 }
 
 fn main() -> Result<()> {
@@ -258,7 +479,7 @@ fn main() -> Result<()> {
     if args.interactive || args.fork {
         interactive_mode(&sessions, args.fork)?;
     } else {
-        print_sessions(&sessions, args.count);
+        print_sessions(&sessions, args.count, args.debug);
     }
 
     Ok(())
@@ -332,6 +553,7 @@ fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>
 
                 Some(Session {
                     id: entry.session_id,
+                    source: SessionSource::Indexed,
                     project,
                     project_path,
                     filepath: filepath.clone(),
@@ -692,9 +914,9 @@ mod tests {
         let project_dir = temp_dir.join("-Users-sirrobin-holy-grail");
         fs::create_dir_all(&project_dir).unwrap();
 
-        // Create fake session files
-        let session1_path = project_dir.join("black-knight.jsonl");
-        let session2_path = project_dir.join("killer-rabbit.jsonl");
+        // Create fake session files (names must match sessionId in index)
+        let session1_path = project_dir.join("black-knight-battle.jsonl");
+        let session2_path = project_dir.join("killer-rabbit-encounter.jsonl");
         fs::write(
             &session1_path,
             r#"{"type":"user","message":"Tis but a scratch"}"#,
@@ -759,8 +981,8 @@ mod tests {
         let project_dir = temp_dir.join("-Users-shopkeeper-ministry-of-silly-walks");
         fs::create_dir_all(&project_dir).unwrap();
 
-        // The parrot exists (it's just resting)
-        let resting_parrot = project_dir.join("norwegian-blue.jsonl");
+        // The parrot exists (it's just resting) - filename must match sessionId
+        let resting_parrot = project_dir.join("resting-parrot.jsonl");
         fs::write(
             &resting_parrot,
             r#"{"type":"user","message":"Beautiful plumage!"}"#,
@@ -819,8 +1041,8 @@ mod tests {
         )
         .unwrap();
 
-        // Good index in another project
-        let quest_path = good_dir.join("quest.jsonl");
+        // Good index in another project (filename must match sessionId)
+        let quest_path = good_dir.join("seek-holy-grail.jsonl");
         fs::write(
             &quest_path,
             r#"{"type":"user","message":"What is your quest?"}"#,
@@ -877,8 +1099,8 @@ mod tests {
         fs::create_dir_all(&french).unwrap();
         fs::create_dir_all(&swamp).unwrap();
 
-        // Camelot session (oldest)
-        let camelot_session = camelot.join("round-table.jsonl");
+        // Camelot session (oldest) - filename must match sessionId
+        let camelot_session = camelot.join("round-table-discussion.jsonl");
         fs::write(&camelot_session, "{}").unwrap();
         fs::write(
             camelot.join("sessions-index.json"),
@@ -896,7 +1118,7 @@ mod tests {
         .unwrap();
 
         // French Castle session (middle)
-        let french_session = french.join("taunting.jsonl");
+        let french_session = french.join("taunt-session.jsonl");
         fs::write(&french_session, "{}").unwrap();
         fs::write(
             french.join("sessions-index.json"),
@@ -914,7 +1136,7 @@ mod tests {
         .unwrap();
 
         // Swamp Castle session (newest)
-        let swamp_session = swamp.join("huge-tracts.jsonl");
+        let swamp_session = swamp.join("inheritance-planning.jsonl");
         fs::write(&swamp_session, "{}").unwrap();
         fs::write(
             swamp.join("sessions-index.json"),
@@ -953,7 +1175,8 @@ mod tests {
         let tim_dir = temp_dir.join("-Users-tim-enchanter");
         fs::create_dir_all(&tim_dir).unwrap();
 
-        let session_path = tim_dir.join("fireball.jsonl");
+        // Filename must match sessionId
+        let session_path = tim_dir.join("big-pointy-teeth.jsonl");
         fs::write(&session_path, "{}").unwrap();
 
         // Minimal index - no summary, no created/modified, no projectPath
@@ -1033,7 +1256,8 @@ mod tests {
         let maynard_dir = temp_dir.join("-Users-maynard-monastery");
         fs::create_dir_all(&maynard_dir).unwrap();
 
-        let session_path = maynard_dir.join("holy-book.jsonl");
+        // Filename must match sessionId
+        let session_path = maynard_dir.join("consult-book.jsonl");
         fs::write(&session_path, "{}").unwrap();
 
         // Test various first_prompt values that should be filtered
@@ -1056,6 +1280,106 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         // first_message should be None because it started with "/"
         assert!(sessions[0].first_message.is_none());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    // =============================================================================
+    // Orphan detection - sessions without index entries
+    // =============================================================================
+
+    #[test]
+    fn find_sessions_discovers_orphaned_files() {
+        // The Spanish Inquisition's session - nobody expected it, so no index entry
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-inquisition-{}", std::process::id()));
+        let inquisition_dir = temp_dir.join("-Users-cardinal-inquisition");
+        fs::create_dir_all(&inquisition_dir).unwrap();
+
+        // Create a session file with no corresponding index entry
+        let orphan_session = inquisition_dir.join("unexpected-session.jsonl");
+        fs::write(
+            &orphan_session,
+            r#"{"type":"user","message":{"role":"user","content":"Nobody expects the Spanish Inquisition!"},"cwd":"/Users/cardinal/inquisition"}"#,
+        )
+        .unwrap();
+
+        // Empty index - the session is truly orphaned
+        fs::write(
+            inquisition_dir.join("sessions-index.json"),
+            r#"{"entries": []}"#,
+        )
+        .unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // Should find the orphaned session
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "unexpected-session");
+        assert_eq!(sessions[0].project, "inquisition");
+        assert_eq!(sessions[0].project_path, "/Users/cardinal/inquisition");
+        assert!(sessions[0].summary.is_none()); // Orphans have no summary
+        assert_eq!(
+            sessions[0].first_message,
+            Some("Nobody expects the Spanish Inquisition!".to_string())
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_merges_indexed_and_orphaned() {
+        // King Arthur's realm - some sessions indexed, some not
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-realm-{}", std::process::id()));
+        let realm_dir = temp_dir.join("-Users-arthur-realm");
+        fs::create_dir_all(&realm_dir).unwrap();
+
+        // Indexed session
+        let indexed_session = realm_dir.join("indexed-quest.jsonl");
+        fs::write(&indexed_session, r#"{"type":"user","message":"I seek the grail"}"#).unwrap();
+
+        // Orphaned session (no index entry)
+        let orphan_session = realm_dir.join("orphan-quest.jsonl");
+        fs::write(
+            &orphan_session,
+            r#"{"type":"user","message":{"role":"user","content":"A wild quest appears!"},"cwd":"/Users/arthur/realm"}"#,
+        )
+        .unwrap();
+
+        // Index only includes one session
+        let index_json = format!(
+            r#"{{
+                "entries": [{{
+                    "sessionId": "indexed-quest",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/arthur/realm",
+                    "summary": "The indexed quest",
+                    "modified": "1975-04-03T10:00:00Z"
+                }}]
+            }}"#,
+            indexed_session.display()
+        );
+        fs::write(realm_dir.join("sessions-index.json"), index_json).unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // Should find both indexed and orphaned sessions
+        assert_eq!(sessions.len(), 2);
+
+        // Check we have both
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"indexed-quest"));
+        assert!(ids.contains(&"orphan-quest"));
+
+        // The indexed one should have a summary
+        let indexed = sessions.iter().find(|s| s.id == "indexed-quest").unwrap();
+        assert_eq!(indexed.summary, Some("The indexed quest".to_string()));
+
+        // The orphan should not have a summary but should have first_message
+        let orphan = sessions.iter().find(|s| s.id == "orphan-quest").unwrap();
+        assert!(orphan.summary.is_none());
+        assert_eq!(orphan.first_message, Some("A wild quest appears!".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
