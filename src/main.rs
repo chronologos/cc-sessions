@@ -168,11 +168,17 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             .as_deref()
                             .and_then(parse_iso_time)
                             .unwrap_or(UNIX_EPOCH);
-                        let modified = entry
+
+                        // Use file mtime if newer than index timestamp (index may be stale)
+                        let index_modified = entry
                             .modified
                             .as_deref()
                             .and_then(parse_iso_time)
                             .unwrap_or(UNIX_EPOCH);
+                        let file_modified = fs::metadata(&filepath)
+                            .and_then(|m| m.modified())
+                            .unwrap_or(UNIX_EPOCH);
+                        let modified = std::cmp::max(index_modified, file_modified);
 
                         let first_message = entry.first_prompt.as_ref().and_then(|p| {
                             if p == "No prompt" || p.starts_with("[Request") || p.starts_with("/") {
