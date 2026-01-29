@@ -17,6 +17,8 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 cc-sessions           # List 15 most recent sessions
 cc-sessions -c 30     # List 30 sessions
 cc-sessions -i        # Interactive fzf picker with transcript preview
+cc-sessions -f        # Fork a session (creates new session ID)
+cc-sessions -i -f     # Interactive mode + fork
 ```
 
 ## Architecture
@@ -47,12 +49,15 @@ Note: The index may contain stale entries for deleted sessions. We filter these 
 
 ## Output Format
 
-List mode shows relative times:
+List mode shows relative times and AI-generated summary:
 ```
-CREATED  MODIFIED PROJECT      FIRST MESSAGE
-─────────────────────────────────────────────────────────────────────────────────────
-2h       now      dotfiles     Execute the Claude Code Docs helper script...
-1d       4h       server       add support for extracting note media
+CREAT  MOD    PROJECT      SUMMARY
+──────────────────────────────────────────────────────────────────────────────────────────
+1h     1h     dotfiles     Shell alias structure refactoring
+2d     3h     bike-power   Bike Power App: Build 10, Landscape Layout
 ```
 
-Interactive mode shows transcript preview with 👤 user / 🤖 assistant prefixes.
+Interactive mode (`-i`):
+- Fuzzy search matches project name, summary, and full transcript metadata
+- Preview pane shows conversation transcript with 👤 user / 🤖 assistant prefixes
+- Use `-f` flag to fork instead of resume (creates new session ID)

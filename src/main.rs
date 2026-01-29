@@ -17,6 +17,10 @@ struct Args {
     /// Interactive mode with fzf
     #[arg(short, long)]
     interactive: bool,
+
+    /// Fork session instead of resuming (creates new session ID)
+    #[arg(short, long)]
+    fork: bool,
 }
 
 #[derive(Debug)]
@@ -28,6 +32,7 @@ struct Session {
     created: SystemTime,
     modified: SystemTime,
     first_message: Option<String>,
+    summary: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +46,7 @@ struct IndexEntry {
     session_id: String,
     full_path: String,
     first_prompt: Option<String>,
+    summary: Option<String>,
     created: Option<String>,
     modified: Option<String>,
     project_path: Option<String>,
@@ -142,8 +148,8 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             .and_then(parse_iso_time)
                             .unwrap_or(UNIX_EPOCH);
 
-                        let first_message = entry.first_prompt.and_then(|p| {
-                            if p == "No prompt" || p.starts_with("[Request") {
+                        let first_message = entry.first_prompt.as_ref().and_then(|p| {
+                            if p == "No prompt" || p.starts_with("[Request") || p.starts_with("/") {
                                 None
                             } else {
                                 Some(p.chars().take(50).collect())
@@ -158,6 +164,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             created,
                             modified,
                             first_message,
+                            summary: entry.summary,
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -173,24 +180,31 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
 
 fn print_sessions(sessions: &[Session], count: usize) {
     println!(
-        "{:<8} {:<8} {:<12} {}",
-        "CREATED", "MODIFIED", "PROJECT", "FIRST MESSAGE"
+        "{:<6} {:<6} {:<12} {}",
+        "CREAT", "MOD", "PROJECT", "SUMMARY"
     );
-    println!("{}", "─".repeat(85));
+    println!("{}", "─".repeat(90));
 
     for session in sessions.iter().take(count) {
         let created = format_time_relative(session.created);
         let modified = format_time_relative(session.modified);
-        let msg = session.first_message.as_deref().unwrap_or("");
+        // Prefer summary, fall back to first_message
+        let desc = session
+            .summary
+            .as_deref()
+            .or(session.first_message.as_deref())
+            .unwrap_or("");
+        // Truncate to fit terminal
+        let desc: String = desc.chars().take(60).collect();
 
         println!(
-            "{:<8} {:<8} {:<12} {}",
-            created, modified, session.project, msg
+            "{:<6} {:<6} {:<12} {}",
+            created, modified, session.project, desc
         );
     }
 
-    println!("{}", "─".repeat(85));
-    println!("Use 'cc-sessions -i' for interactive picker with fzf");
+    println!("{}", "─".repeat(90));
+    println!("Use 'cc-sessions -i' for interactive picker, -f to fork");
 }
 
 fn main() -> Result<()> {
@@ -203,8 +217,8 @@ fn main() -> Result<()> {
 
     let sessions = find_sessions(&projects_dir)?;
 
-    if args.interactive {
-        interactive_mode(&sessions)?;
+    if args.interactive || args.fork {
+        interactive_mode(&sessions, args.fork)?;
     } else {
         print_sessions(&sessions, args.count);
     }
@@ -212,7 +226,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn interactive_mode(sessions: &[Session]) -> Result<()> {
+fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -221,39 +235,47 @@ fn interactive_mode(sessions: &[Session]) -> Result<()> {
         .map(|s| {
             let modified = format_time_relative(s.modified);
             let created = format_time_relative(s.created);
-            let msg: String = s
-                .first_message
+            let summary: String = s
+                .summary
                 .as_deref()
                 .unwrap_or("")
                 .chars()
-                .take(40)
+                .take(50)
                 .collect();
-            // filepath \t session_id \t project_path \t display
+            // Fields: filepath, session_id, project_path, summary (searchable), display
+            // fzf searches all fields but only displays field 5+
             format!(
-                "{}\t{}\t{}\t{:<8} {:<8} {:<10} {}",
+                "{}\t{}\t{}\t{}\t{:<6} {:<6} {:<12} {}",
                 s.filepath.display(),
                 s.id,
                 s.project_path,
+                s.summary.as_deref().unwrap_or(""), // full summary for search
                 created,
                 modified,
                 s.project,
-                msg
+                summary
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Preview: extract filepath from field 1, run jaq
-    let preview_cmd = r#"f=$(echo {} | cut -f1); [ -f "$f" ] && jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -40 || echo "No preview""#;
+    // Preview: extract filepath from field 1, run jaq to show transcript
+    let preview_cmd = r#"f=$(echo {} | cut -f1); [ -f "$f" ] && jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -100 || echo "No preview""#;
+
+    let header = if fork {
+        "FORK MODE - CREAT MOD   PROJECT      SUMMARY"
+    } else {
+        "CREAT  MOD    PROJECT      SUMMARY"
+    };
 
     let mut fzf = Command::new("fzf")
         .args([
             "--delimiter=\t",
-            "--with-nth=4",
+            "--with-nth=5..",
             "--preview",
             preview_cmd,
             "--preview-window=right:50%:wrap",
-            "--header=CREATED  MODIFIED PROJECT    FIRST MESSAGE",
+            &format!("--header={}", header),
             "--no-hscroll",
         ])
         .stdin(Stdio::piped())
@@ -273,15 +295,24 @@ fn interactive_mode(sessions: &[Session]) -> Result<()> {
         if parts.len() >= 3 {
             let session_id = parts[1];
             let project_path = parts[2];
-            println!("Resuming session {} in {}", session_id, project_path);
+
+            let (action, flag) = if fork {
+                ("Forking", "--fork-session")
+            } else {
+                ("Resuming", "")
+            };
+            println!("{} session {} in {}", action, session_id, project_path);
 
             // Change to project directory and run claude
-            Command::new("zsh")
-                .args([
-                    "-c",
-                    &format!("cd '{}' && claude -r '{}'", project_path, session_id),
-                ])
-                .status()?;
+            let cmd = if fork {
+                format!(
+                    "cd '{}' && claude -r '{}' {}",
+                    project_path, session_id, flag
+                )
+            } else {
+                format!("cd '{}' && claude -r '{}'", project_path, session_id)
+            };
+            Command::new("zsh").args(["-c", &cmd]).status()?;
         }
     }
 
