@@ -178,7 +178,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             if p == "No prompt" || p.starts_with("[Request") || p.starts_with("/") {
                                 None
                             } else {
-                                Some(p.chars().take(50).collect())
+                                Some(normalize_summary(p, 50))
                             }
                         });
 
@@ -363,7 +363,7 @@ fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Optio
                             && !t.starts_with("[Request")
                             && !t.starts_with('<')
                         {
-                            first_prompt = Some(t.chars().take(50).collect());
+                            first_prompt = Some(normalize_summary(&t, 50));
                         }
                     }
                 }
@@ -717,6 +717,41 @@ fn format_time_relative(time: SystemTime) -> String {
     } else {
         format!("{}w", secs / 604800)
     }
+}
+
+/// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
+fn normalize_summary(text: &str, max_chars: usize) -> String {
+    // Collapse all whitespace (including newlines) to single spaces
+    let normalized: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Strip common markdown prefixes
+    let stripped = normalized
+        .trim_start_matches('#')
+        .trim_start_matches('*')
+        .trim_start();
+
+    // Count chars (not bytes) for proper Unicode handling
+    let chars: Vec<char> = stripped.chars().collect();
+    if chars.len() <= max_chars {
+        return stripped.to_string();
+    }
+
+    // Truncate at char boundary
+    let truncated: String = chars[..max_chars].iter().collect();
+
+    // Find last space to break at word boundary (rfind returns byte index, which is safe for ASCII space)
+    if let Some(last_space_byte) = truncated.rfind(' ') {
+        // Convert byte index to char index by counting chars up to that point
+        let chars_before_space = truncated[..last_space_byte].chars().count();
+        if chars_before_space > max_chars / 2 {
+            let word_break: String = chars[..chars_before_space].iter().collect();
+            return format!("{}...", word_break);
+        }
+    }
+    format!("{}...", truncated)
 }
 
 #[cfg(test)]
