@@ -5,6 +5,7 @@ use grep_searcher::Searcher;
 use grep_searcher::sinks::UTF8;
 use rayon::prelude::*;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -124,6 +125,66 @@ fn parse_iso_time(s: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
+/// Parse optional ISO timestamp string, defaulting to UNIX_EPOCH
+fn parse_timestamp(s: Option<&str>) -> SystemTime {
+    s.and_then(parse_iso_time).unwrap_or(UNIX_EPOCH)
+}
+
+/// Get file modification time, defaulting to UNIX_EPOCH on error
+fn file_mtime(path: &PathBuf) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// Extract project name from path or directory name fallback
+fn extract_project_name(project_path: &str, fallback_dir: &str) -> String {
+    // Prefer cwd-based project name
+    if !project_path.is_empty() {
+        return project_path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+    }
+
+    // Parse directory name: "-Users-iantay-Documents-repos-foo" -> "foo"
+    const USER_PREFIXES: &[&str] = &["-Users-iantay-", "-Users-"];
+    const PATH_PREFIXES: &[&str] = &[
+        "Documents-repos-",
+        "Documents-",
+        "repos-",
+        "third-party-repos-",
+    ];
+
+    let stripped = USER_PREFIXES
+        .iter()
+        .find_map(|p| fallback_dir.strip_prefix(p))
+        .unwrap_or(fallback_dir);
+
+    PATH_PREFIXES
+        .iter()
+        .find_map(|p| stripped.strip_prefix(p))
+        .unwrap_or(stripped)
+        .to_string()
+}
+
+/// Extract text from message content (string or array of content blocks)
+fn extract_text_content(content: &serde_json::Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+
+    content.as_array()?.iter().find_map(|c| {
+        if c.get("type")?.as_str()? == "text" {
+            Some(c.get("text")?.as_str()?.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
     // Find all sessions-index.json files
     let index_files: Vec<_> = WalkDir::new(projects_dir)
@@ -136,7 +197,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
         .collect();
 
     // Track indexed session IDs to find orphans later
-    let mut indexed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut indexed_ids: HashSet<String> = HashSet::new();
 
     // Process in parallel with rayon
     let sessions: Vec<Session> = index_files
@@ -163,22 +224,13 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             .unwrap_or("unknown")
                             .to_string();
 
-                        let created = entry
-                            .created
-                            .as_deref()
-                            .and_then(parse_iso_time)
-                            .unwrap_or(UNIX_EPOCH);
+                        let created = parse_timestamp(entry.created.as_deref());
 
                         // Use file mtime if newer than index timestamp (index may be stale)
-                        let index_modified = entry
-                            .modified
-                            .as_deref()
-                            .and_then(parse_iso_time)
-                            .unwrap_or(UNIX_EPOCH);
-                        let file_modified = fs::metadata(&filepath)
-                            .and_then(|m| m.modified())
-                            .unwrap_or(UNIX_EPOCH);
-                        let modified = std::cmp::max(index_modified, file_modified);
+                        let modified = std::cmp::max(
+                            parse_timestamp(entry.modified.as_deref()),
+                            file_mtime(&filepath),
+                        );
 
                         let first_message = entry.first_prompt.as_ref().and_then(|p| {
                             if p == "No prompt" || p.starts_with("[Request") || p.starts_with("/") {
@@ -217,26 +269,30 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
         .max_depth(2)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().is_some_and(|ext| ext == "jsonl")
-                && !e.path().to_string_lossy().contains("/subagents/")
-        })
         .filter_map(|e| {
-            let filepath = e.path().to_path_buf();
-            let id = filepath.file_stem()?.to_string_lossy().to_string();
+            let path = e.path();
 
-            // Skip if already indexed
-            if indexed_ids.contains(&id) {
+            // Filter by extension and skip subagents directory
+            if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
+                return None;
+            }
+            if path.to_string_lossy().contains("/subagents/") {
                 return None;
             }
 
-            // Skip agent-* files (subagent sessions)
-            if id.starts_with("agent-") {
+            let id = path.file_stem()?.to_string_lossy();
+
+            // Skip indexed and agent-* sessions
+            if indexed_ids.contains(id.as_ref()) || id.starts_with("agent-") {
                 return None;
             }
 
-            // Extract metadata from file, passing parent directory for fallback project name
-            let parent_dir = filepath.parent()?.file_name()?.to_string_lossy().to_string();
+            let filepath = path.to_path_buf();
+            let parent_dir = filepath
+                .parent()?
+                .file_name()?
+                .to_string_lossy()
+                .to_string();
             session_from_orphan_file(&filepath, &parent_dir)
         })
         .collect();
@@ -265,31 +321,7 @@ fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option
         return None;
     }
 
-    // Derive project name from cwd, or fall back to parsing directory name
-    let project = if !project_path.is_empty() {
-        project_path
-            .split('/')
-            .last()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("unknown")
-            .to_string()
-    } else {
-        // Parse directory name like "-Users-iantay-Documents-repos-bike-power" -> "bike-power"
-        // Strategy: strip known prefixes to get the actual project name
-        let stripped = parent_dir_name
-            .strip_prefix("-Users-iantay-")
-            .or_else(|| parent_dir_name.strip_prefix("-Users-"))
-            .unwrap_or(parent_dir_name);
-
-        // Remove common path prefixes (Documents-repos-, etc.)
-        stripped
-            .strip_prefix("Documents-repos-")
-            .or_else(|| stripped.strip_prefix("Documents-"))
-            .or_else(|| stripped.strip_prefix("repos-"))
-            .or_else(|| stripped.strip_prefix("third-party-repos-"))
-            .unwrap_or(stripped)
-            .to_string()
-    };
+    let project = extract_project_name(&project_path, parent_dir_name);
 
     Some(Session {
         id,
@@ -345,29 +377,9 @@ fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Optio
             // Extract first user prompt
             if first_prompt.is_none() && entry_type == Some("user") {
                 if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
-                    let text = if content.is_string() {
-                        content.as_str().map(|s| s.to_string())
-                    } else if content.is_array() {
-                        content.as_array().and_then(|arr| {
-                            arr.iter()
-                                .filter_map(|c| {
-                                    if c.get("type")?.as_str()? == "text" {
-                                        c.get("text")?.as_str().map(|s| s.to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .next()
-                        })
-                    } else {
-                        None
-                    };
-
-                    if let Some(t) = text {
+                    if let Some(t) = extract_text_content(content) {
                         // Filter out system prompts and XML-tagged content
-                        if !t.starts_with('/')
-                            && !t.starts_with("[Request")
-                            && !t.starts_with('<')
+                        if !t.starts_with('/') && !t.starts_with("[Request") && !t.starts_with('<')
                         {
                             first_prompt = Some(normalize_summary(&t, 50));
                         }
@@ -414,10 +426,21 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
         }
 
         // Show stats
-        let indexed = sessions.iter().filter(|s| s.source == SessionSource::Indexed).count();
-        let orphans = sessions.iter().filter(|s| s.source == SessionSource::Orphan).count();
+        let indexed = sessions
+            .iter()
+            .filter(|s| s.source == SessionSource::Indexed)
+            .count();
+        let orphans = sessions
+            .iter()
+            .filter(|s| s.source == SessionSource::Orphan)
+            .count();
         println!("{}", "─".repeat(100));
-        println!("Total: {} (indexed: {}, orphans: {})", sessions.len(), indexed, orphans);
+        println!(
+            "Total: {} (indexed: {}, orphans: {})",
+            sessions.len(),
+            indexed,
+            orphans
+        );
     } else {
         println!(
             "{:<6} {:<6} {:<16} {}",
@@ -660,22 +683,15 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
             let session_id = parts[1];
             let project_path = parts[2];
 
-            let (action, flag) = if fork {
-                ("Forking", "--fork-session")
-            } else {
-                ("Resuming", "")
-            };
+            let action = if fork { "Forking" } else { "Resuming" };
             println!("{} session {} in {}", action, session_id, project_path);
 
             // Change to project directory and run claude
-            let cmd = if fork {
-                format!(
-                    "cd '{}' && claude -r '{}' {}",
-                    project_path, session_id, flag
-                )
-            } else {
-                format!("cd '{}' && claude -r '{}'", project_path, session_id)
-            };
+            let fork_flag = if fork { " --fork-session" } else { "" };
+            let cmd = format!(
+                "cd '{}' && claude -r '{}'{}",
+                project_path, session_id, fork_flag
+            );
             Command::new("zsh").args(["-c", &cmd]).status()?;
         }
     }
@@ -728,36 +744,28 @@ fn format_time_relative(time: SystemTime) -> String {
 /// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
 fn normalize_summary(text: &str, max_chars: usize) -> String {
     // Collapse all whitespace (including newlines) to single spaces
-    let normalized: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
 
     // Strip common markdown prefixes
-    let stripped = normalized
-        .trim_start_matches('#')
-        .trim_start_matches('*')
-        .trim_start();
+    let stripped = normalized.trim_start_matches(['#', '*']).trim_start();
 
-    // Count chars (not bytes) for proper Unicode handling
-    let chars: Vec<char> = stripped.chars().collect();
-    if chars.len() <= max_chars {
+    // Fast path for short strings
+    if stripped.chars().count() <= max_chars {
         return stripped.to_string();
     }
 
-    // Truncate at char boundary
-    let truncated: String = chars[..max_chars].iter().collect();
+    // Truncate at char boundary, break at word if possible
+    let truncated: String = stripped.chars().take(max_chars).collect();
 
-    // Find last space to break at word boundary (rfind returns byte index, which is safe for ASCII space)
-    if let Some(last_space_byte) = truncated.rfind(' ') {
-        // Convert byte index to char index by counting chars up to that point
-        let chars_before_space = truncated[..last_space_byte].chars().count();
-        if chars_before_space > max_chars / 2 {
-            let word_break: String = chars[..chars_before_space].iter().collect();
-            return format!("{}...", word_break);
-        }
-    }
-    format!("{}...", truncated)
+    // Try to break at last word boundary (if past halfway point)
+    let break_point = truncated
+        .rmatch_indices(' ')
+        .next()
+        .filter(|(i, _)| *i > max_chars / 2)
+        .map(|(i, _)| i)
+        .unwrap_or(truncated.len());
+
+    format!("{}...", &truncated[..break_point])
 }
 
 #[cfg(test)]
@@ -1332,8 +1340,10 @@ mod tests {
     #[test]
     fn find_sessions_discovers_orphaned_files() {
         // The Spanish Inquisition's session - nobody expected it, so no index entry
-        let temp_dir =
-            std::env::temp_dir().join(format!("cc-session-test-inquisition-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-inquisition-{}",
+            std::process::id()
+        ));
         let inquisition_dir = temp_dir.join("-Users-cardinal-inquisition");
         fs::create_dir_all(&inquisition_dir).unwrap();
 
@@ -1378,7 +1388,11 @@ mod tests {
 
         // Indexed session
         let indexed_session = realm_dir.join("indexed-quest.jsonl");
-        fs::write(&indexed_session, r#"{"type":"user","message":"I seek the grail"}"#).unwrap();
+        fs::write(
+            &indexed_session,
+            r#"{"type":"user","message":"I seek the grail"}"#,
+        )
+        .unwrap();
 
         // Orphaned session (no index entry)
         let orphan_session = realm_dir.join("orphan-quest.jsonl");
@@ -1420,7 +1434,10 @@ mod tests {
         // The orphan should not have a summary but should have first_message
         let orphan = sessions.iter().find(|s| s.id == "orphan-quest").unwrap();
         assert!(orphan.summary.is_none());
-        assert_eq!(orphan.first_message, Some("A wild quest appears!".to_string()));
+        assert_eq!(
+            orphan.first_message,
+            Some("A wild quest appears!".to_string())
+        );
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
