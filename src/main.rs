@@ -138,6 +138,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                         let project = project_path
                             .split('/')
                             .last()
+                            .filter(|s| !s.is_empty())
                             .unwrap_or("unknown")
                             .to_string();
 
@@ -655,6 +656,264 @@ mod tests {
             sessions[0].summary,
             Some("Pining for the fjords".to_string())
         );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_handles_corrupted_index() {
+        // The Knights Who Say Ni have corrupted the sacred index
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-ni-{}", std::process::id()));
+        let knights_dir = temp_dir.join("-Users-knight-shrubbery");
+        let good_dir = temp_dir.join("-Users-arthur-camelot");
+        fs::create_dir_all(&knights_dir).unwrap();
+        fs::create_dir_all(&good_dir).unwrap();
+
+        // Corrupted index - not valid JSON (the knights demand a shrubbery, not JSON)
+        fs::write(
+            knights_dir.join("sessions-index.json"),
+            "NI! NI! NI! We demand a shrubbery!",
+        )
+        .unwrap();
+
+        // Good index in another project
+        let quest_path = good_dir.join("quest.jsonl");
+        fs::write(&quest_path, r#"{"type":"user","message":"What is your quest?"}"#).unwrap();
+        let good_index = format!(
+            r#"{{
+                "entries": [{{
+                    "sessionId": "seek-holy-grail",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/arthur/camelot",
+                    "summary": "To seek the Holy Grail"
+                }}]
+            }}"#,
+            quest_path.display()
+        );
+        fs::write(good_dir.join("sessions-index.json"), good_index).unwrap();
+
+        // Should gracefully skip corrupted index and return sessions from good index
+        let sessions = find_sessions(&temp_dir).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "seek-holy-grail");
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_handles_empty_index() {
+        // The Bridgekeeper's index has no entries - none shall pass
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-bridge-{}", std::process::id()));
+        let bridge_dir = temp_dir.join("-Users-bridgekeeper-gorge");
+        fs::create_dir_all(&bridge_dir).unwrap();
+
+        // Valid JSON but empty entries array
+        fs::write(
+            bridge_dir.join("sessions-index.json"),
+            r#"{"entries": []}"#,
+        )
+        .unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+        assert_eq!(sessions.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_merges_multiple_projects() {
+        // Sessions from Camelot, the French Castle, and Swamp Castle
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-castles-{}", std::process::id()));
+
+        let camelot = temp_dir.join("-Users-arthur-camelot");
+        let french = temp_dir.join("-Users-french-castle");
+        let swamp = temp_dir.join("-Users-dennis-swamp-castle");
+        fs::create_dir_all(&camelot).unwrap();
+        fs::create_dir_all(&french).unwrap();
+        fs::create_dir_all(&swamp).unwrap();
+
+        // Camelot session (oldest)
+        let camelot_session = camelot.join("round-table.jsonl");
+        fs::write(&camelot_session, "{}").unwrap();
+        fs::write(
+            camelot.join("sessions-index.json"),
+            format!(
+                r#"{{"entries": [{{
+                    "sessionId": "round-table-discussion",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/arthur/camelot",
+                    "summary": "On second thought, let's not go there",
+                    "modified": "1975-04-01T10:00:00Z"
+                }}]}}"#,
+                camelot_session.display()
+            ),
+        )
+        .unwrap();
+
+        // French Castle session (middle)
+        let french_session = french.join("taunting.jsonl");
+        fs::write(&french_session, "{}").unwrap();
+        fs::write(
+            french.join("sessions-index.json"),
+            format!(
+                r#"{{"entries": [{{
+                    "sessionId": "taunt-session",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/french/castle",
+                    "summary": "I fart in your general direction",
+                    "modified": "1975-04-02T10:00:00Z"
+                }}]}}"#,
+                french_session.display()
+            ),
+        )
+        .unwrap();
+
+        // Swamp Castle session (newest)
+        let swamp_session = swamp.join("huge-tracts.jsonl");
+        fs::write(&swamp_session, "{}").unwrap();
+        fs::write(
+            swamp.join("sessions-index.json"),
+            format!(
+                r#"{{"entries": [{{
+                    "sessionId": "inheritance-planning",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/dennis/swamp-castle",
+                    "summary": "But she's got huge... tracts of land",
+                    "modified": "1975-04-03T10:00:00Z"
+                }}]}}"#,
+                swamp_session.display()
+            ),
+        )
+        .unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // Should have all 3 sessions, sorted by modified (newest first)
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].id, "inheritance-planning");
+        assert_eq!(sessions[0].project, "swamp-castle");
+        assert_eq!(sessions[1].id, "taunt-session");
+        assert_eq!(sessions[1].project, "castle");
+        assert_eq!(sessions[2].id, "round-table-discussion");
+        assert_eq!(sessions[2].project, "camelot");
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_handles_missing_optional_fields() {
+        // Tim the Enchanter's minimal session - just the required fields
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-tim-{}", std::process::id()));
+        let tim_dir = temp_dir.join("-Users-tim-enchanter");
+        fs::create_dir_all(&tim_dir).unwrap();
+
+        let session_path = tim_dir.join("fireball.jsonl");
+        fs::write(&session_path, "{}").unwrap();
+
+        // Minimal index - no summary, no created/modified, no projectPath
+        let index_json = format!(
+            r#"{{
+                "entries": [{{
+                    "sessionId": "big-pointy-teeth",
+                    "fullPath": "{}"
+                }}]
+            }}"#,
+            session_path.display()
+        );
+        fs::write(tim_dir.join("sessions-index.json"), index_json).unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "big-pointy-teeth");
+        assert_eq!(sessions[0].project, "unknown"); // No projectPath falls back to "unknown"
+        assert!(sessions[0].summary.is_none());
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_all_files_missing() {
+        // All the brave knights' sessions have been eaten by the Legendary Black Beast of Aaaargh
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-beast-{}", std::process::id()));
+        let cave_dir = temp_dir.join("-Users-knights-cave");
+        fs::create_dir_all(&cave_dir).unwrap();
+
+        // Index references sessions that don't exist
+        let index_json = r#"{
+            "entries": [
+                {
+                    "sessionId": "sir-robin",
+                    "fullPath": "/eaten/by/beast/robin.jsonl",
+                    "summary": "Bravely ran away"
+                },
+                {
+                    "sessionId": "sir-lancelot",
+                    "fullPath": "/eaten/by/beast/lancelot.jsonl",
+                    "summary": "Got a bit carried away"
+                }
+            ]
+        }"#;
+        fs::write(cave_dir.join("sessions-index.json"), index_json).unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        // All sessions are gone - eaten by the beast
+        assert_eq!(sessions.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_empty_projects_dir() {
+        // The Castle of Aaaargh - completely empty
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-aaaargh-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        // No project directories at all
+        let sessions = find_sessions(&temp_dir).unwrap();
+        assert_eq!(sessions.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_filters_system_prompts() {
+        // Brother Maynard's sessions with various first_prompt values
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-maynard-{}", std::process::id()));
+        let maynard_dir = temp_dir.join("-Users-maynard-monastery");
+        fs::create_dir_all(&maynard_dir).unwrap();
+
+        let session_path = maynard_dir.join("holy-book.jsonl");
+        fs::write(&session_path, "{}").unwrap();
+
+        // Test various first_prompt values that should be filtered
+        let index_json = format!(
+            r#"{{
+                "entries": [{{
+                    "sessionId": "consult-book",
+                    "fullPath": "{}",
+                    "projectPath": "/Users/maynard/monastery",
+                    "firstPrompt": "/help",
+                    "summary": null
+                }}]
+            }}"#,
+            session_path.display()
+        );
+        fs::write(maynard_dir.join("sessions-index.json"), index_json).unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        // first_message should be None because it started with "/"
+        assert!(sessions[0].first_message.is_none());
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
