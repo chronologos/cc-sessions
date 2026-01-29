@@ -56,6 +56,7 @@ struct Session {
     modified: SystemTime,
     first_message: Option<String>,
     summary: Option<String>,
+    name: Option<String>, // customTitle from /rename - indicates important session
 }
 
 #[derive(Deserialize)]
@@ -70,6 +71,7 @@ struct IndexEntry {
     full_path: String,
     first_prompt: Option<String>,
     summary: Option<String>,
+    custom_title: Option<String>,
     created: Option<String>,
     modified: Option<String>,
     project_path: Option<String>,
@@ -250,6 +252,7 @@ fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                             modified,
                             first_message,
                             summary: entry.summary,
+                            name: entry.custom_title,
                         })
                     })
                     .collect::<Vec<_>>(),
@@ -333,6 +336,7 @@ fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option
         modified,
         first_message,
         summary,
+        name: None, // Orphans don't have customTitle
     })
 }
 
@@ -412,12 +416,7 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
                 SessionSource::Indexed => "index",
                 SessionSource::Orphan => "orphan",
             };
-            let desc = session
-                .summary
-                .as_deref()
-                .or(session.first_message.as_deref())
-                .unwrap_or("");
-            let desc: String = desc.chars().take(45).collect();
+            let desc = format_session_desc(session, 45);
 
             println!(
                 "{:<6} {:<6} {:<8} {:<16} {}",
@@ -451,12 +450,7 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
-            let desc = session
-                .summary
-                .as_deref()
-                .or(session.first_message.as_deref())
-                .unwrap_or("");
-            let desc: String = desc.chars().take(55).collect();
+            let desc = format_session_desc(session, 55);
 
             println!(
                 "{:<6} {:<6} {:<16} {}",
@@ -590,6 +584,7 @@ fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>
                     modified,
                     first_message: entry.first_prompt,
                     summary: entry.summary,
+                    name: entry.custom_title,
                 })
             })
         })
@@ -739,6 +734,33 @@ fn format_time_relative(time: SystemTime) -> String {
     } else {
         format!("{}w", secs / 604800)
     }
+}
+
+/// Format session description: show name (★) if present, otherwise summary/first_message
+fn format_session_desc(session: &Session, max_chars: usize) -> String {
+    if let Some(ref name) = session.name {
+        // Named sessions show ★ prefix with name, then summary if space allows
+        let prefix = format!("★ {}", name);
+        if prefix.chars().count() >= max_chars {
+            return prefix.chars().take(max_chars).collect();
+        }
+        if let Some(ref summary) = session.summary {
+            let remaining = max_chars - prefix.chars().count() - 3; // " - " separator
+            if remaining > 10 {
+                let summary_truncated: String = summary.chars().take(remaining).collect();
+                return format!("{} - {}", prefix, summary_truncated);
+            }
+        }
+        return prefix;
+    }
+
+    // No name - use summary or first_message
+    session
+        .summary
+        .as_deref()
+        .or(session.first_message.as_deref())
+        .map(|s| s.chars().take(max_chars).collect())
+        .unwrap_or_default()
 }
 
 /// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
