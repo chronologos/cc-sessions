@@ -388,7 +388,7 @@ fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Optio
 fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
     if debug {
         println!(
-            "{:<6} {:<6} {:<8} {:<12} {}",
+            "{:<6} {:<6} {:<8} {:<16} {}",
             "CREAT", "MOD", "SOURCE", "PROJECT", "SUMMARY"
         );
         println!("{}", "─".repeat(100));
@@ -405,10 +405,10 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
                 .as_deref()
                 .or(session.first_message.as_deref())
                 .unwrap_or("");
-            let desc: String = desc.chars().take(50).collect();
+            let desc: String = desc.chars().take(45).collect();
 
             println!(
-                "{:<6} {:<6} {:<8} {:<12} {}",
+                "{:<6} {:<6} {:<8} {:<16} {}",
                 created, modified, source, session.project, desc
             );
         }
@@ -420,7 +420,7 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
         println!("Total: {} (indexed: {}, orphans: {})", sessions.len(), indexed, orphans);
     } else {
         println!(
-            "{:<6} {:<6} {:<12} {}",
+            "{:<6} {:<6} {:<16} {}",
             "CREAT", "MOD", "PROJECT", "SUMMARY"
         );
         println!("{}", "─".repeat(90));
@@ -433,10 +433,10 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
                 .as_deref()
                 .or(session.first_message.as_deref())
                 .unwrap_or("");
-            let desc: String = desc.chars().take(60).collect();
+            let desc: String = desc.chars().take(55).collect();
 
             println!(
-                "{:<6} {:<6} {:<12} {}",
+                "{:<6} {:<6} {:<16} {}",
                 created, modified, session.project, desc
             );
         }
