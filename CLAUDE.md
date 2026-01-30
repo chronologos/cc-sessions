@@ -13,6 +13,21 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions  # macOS
 
 ## Architecture
 
+### Code Organization
+
+```
+src/
+  main.rs         # CLI, display, fzf - general/timeless code
+  claude_code.rs  # Session loading, JSONL parsing - format-specific
+```
+
+**Boundary principle:** If Claude Code changes its storage format, changes should be isolated to `claude_code.rs`. The `Session` struct in `main.rs` acts as an abstraction layer.
+
+| Module | Responsibility | Changes when... |
+|--------|---------------|-----------------|
+| `main.rs` | CLI args, display formatting, fzf integration | UI/UX requirements change |
+| `claude_code.rs` | Index parsing, JSONL reading, path discovery | Claude Code format changes |
+
 ### Session Storage Structure
 
 ```mermaid
