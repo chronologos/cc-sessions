@@ -14,13 +14,13 @@ use std::time::SystemTime;
 #[derive(Parser)]
 #[command(name = "cc-session", about = "List Claude Code sessions")]
 struct Args {
-    /// Number of sessions to show
+    /// Number of sessions to show (for list mode)
     #[arg(short, long, default_value = "15")]
     count: usize,
 
-    /// Interactive mode
+    /// List mode (non-interactive) - show sessions as a table
     #[arg(short, long)]
-    interactive: bool,
+    list: bool,
 
     /// Fork session instead of resuming (creates new session ID)
     #[arg(short, long)]
@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     preview: Option<PathBuf>,
 
-    /// Debug mode - show where sessions come from
+    /// Debug mode - show session IDs and stats
     #[arg(long)]
     debug: bool,
 }
@@ -90,10 +90,10 @@ fn main() -> Result<()> {
         anyhow::bail!("No sessions found");
     }
 
-    if args.interactive || args.fork {
-        interactive_mode(&sessions, args.fork)?;
-    } else {
+    if args.list {
         print_sessions(&sessions, args.count, args.debug);
+    } else {
+        interactive_mode(&sessions, args.fork)?;
     }
 
     Ok(())

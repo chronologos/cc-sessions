@@ -29,18 +29,26 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 ## Usage
 
 ```bash
-cc-sessions              # List 15 most recent sessions
-cc-sessions -c 30        # List 30 sessions
-cc-sessions -i           # Interactive picker with transcript preview
-cc-sessions -f           # Fork a session (creates new session ID)
-cc-sessions -i -f        # Interactive mode + fork
+cc-sessions              # Interactive picker (default)
+cc-sessions -f           # Fork mode - creates new session ID instead of resuming
 cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
-cc-sessions --debug      # Show session IDs and stats
+cc-sessions -l           # List mode (non-interactive table)
+cc-sessions -l -c 30     # List 30 sessions
+cc-sessions -l --debug   # List with session IDs and stats
 ```
 
-### List mode
+### Interactive mode (default)
 
-Shows sessions with relative timestamps and AI-generated summaries:
+- **Fuzzy search** through project names and summaries
+- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
+- **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
+- **Enter** to resume session in the original project directory
+- **esc** clears search filter, or exits if no filter active
+- Use `-f` to fork instead of resume (creates new session ID)
+
+### List mode (`-l`)
+
+Shows sessions as a table with relative timestamps and AI-generated summaries:
 
 ```
 CREAT  MOD    PROJECT          SUMMARY
@@ -50,16 +58,7 @@ CREAT  MOD    PROJECT          SUMMARY
 4h     3h     cc-session       ★ my-session - Claude Code session improvements
 ```
 
-**Named sessions**: Sessions renamed with `/rename` in Claude Code show a `★` prefix, indicating importance.
-
-### Interactive mode (`-i`)
-
-- **Fuzzy search** through project names and summaries
-- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
-- **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
-- **Enter** to resume session in the original project directory
-- **esc** clears search filter, or exits if no filter active
-- Use `-f` to fork instead of resume (creates new session ID)
+Sessions renamed with `/rename` in Claude Code show a `★` prefix.
 
 ## Features
 
