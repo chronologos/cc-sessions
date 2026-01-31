@@ -15,19 +15,19 @@ use std::time::SystemTime;
 #[command(name = "cc-session", about = "List Claude Code sessions")]
 struct Args {
     /// Number of sessions to show (for list mode)
-    #[arg(short, long, default_value = "15")]
+    #[arg(long, default_value = "15")]
     count: usize,
 
     /// List mode (non-interactive) - show sessions as a table
-    #[arg(short, long)]
+    #[arg(long)]
     list: bool,
 
     /// Fork session instead of resuming (creates new session ID)
-    #[arg(short, long)]
+    #[arg(long)]
     fork: bool,
 
     /// Filter by project name (substring match, case-insensitive)
-    #[arg(short, long)]
+    #[arg(long)]
     project: Option<String>,
 
     /// Preview a session file (internal use by interactive mode)
@@ -148,7 +148,7 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
         }
 
         println!("{}", "─".repeat(90));
-        println!("Use 'cc-sessions -i' for interactive picker, -f to fork");
+        println!("Use 'cc-sessions' for interactive picker, --fork to fork");
     }
 }
 

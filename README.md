@@ -29,12 +29,12 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 ## Usage
 
 ```bash
-cc-sessions              # Interactive picker (default)
-cc-sessions -f           # Fork mode - creates new session ID instead of resuming
-cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
-cc-sessions -l           # List mode (non-interactive table)
-cc-sessions -l -c 30     # List 30 sessions
-cc-sessions -l --debug   # List with session IDs and stats
+cc-sessions                      # Interactive picker (default)
+cc-sessions --fork               # Fork mode - creates new session ID instead of resuming
+cc-sessions --project dotfiles   # Filter by project name (case-insensitive)
+cc-sessions --list               # List mode (non-interactive table)
+cc-sessions --list --count 30    # List 30 sessions
+cc-sessions --list --debug       # List with session IDs and stats
 ```
 
 ### Interactive mode (default)
@@ -44,9 +44,9 @@ cc-sessions -l --debug   # List with session IDs and stats
 - **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
 - **Enter** to resume session in the original project directory
 - **esc** clears search filter, or exits if no filter active
-- Use `-f` to fork instead of resume (creates new session ID)
+- Use `--fork` to fork instead of resume (creates new session ID)
 
-### List mode (`-l`)
+### List mode (`--list`)
 
 Shows sessions as a table with relative timestamps and AI-generated summaries:
 
@@ -77,8 +77,8 @@ Claude Code stores session data in `~/.claude/projects/`. This tool:
 4. Filters out empty sessions and non-session files
 
 When you select a session:
-- **Resume** (`-r`): Continues the existing session
-- **Fork** (`-f`): Creates a new session with the conversation history
+- **Resume** (default): Continues the existing session
+- **Fork** (`--fork`): Creates a new session with the conversation history
 
 ## License
 
