@@ -320,6 +320,287 @@ fn truncate_str(s: &str, max: usize) -> String {
     }
 }
 
+/// Generate preview content as a string (for skim's preview pane)
+fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(filepath).context("Could not open session file")?;
+    let reader = BufReader::new(file);
+
+    const CYAN: &str = "\x1b[36m";
+    const YELLOW: &str = "\x1b[33m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut output = String::new();
+    let mut line_count = 0;
+    const MAX_LINES: usize = 100;
+
+    for line in reader.lines() {
+        if line_count >= MAX_LINES {
+            break;
+        }
+
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
+
+        match entry_type {
+            Some("user") => {
+                if let Some(text) = extract_message_text(&entry) {
+                    if !text.starts_with('[') && !text.starts_with('<') && !text.starts_with('/') {
+                        let first_line = text.lines().next().unwrap_or(&text);
+                        let truncated = truncate_str(first_line, 120);
+                        output.push_str(&format!("{}U: {}{}\n", CYAN, truncated, RESET));
+                        line_count += 1;
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = extract_message_text(&entry) {
+                    let first_line = text.lines().next().unwrap_or(&text);
+                    let truncated = truncate_str(first_line, 80);
+                    output.push_str(&format!("{}A: {}{}\n", YELLOW, truncated, RESET));
+                    line_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if output.is_empty() {
+        output.push_str("(empty session)");
+    }
+
+    Ok(output)
+}
+
+/// A message from the transcript
+struct Message {
+    role: String, // "user" or "assistant"
+    text: String,
+}
+
+/// Generate preview showing matching messages with full conversation context
+fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(filepath).context("Could not open session file")?;
+    let reader = BufReader::new(file);
+
+    // Collect all messages first
+    let mut messages: Vec<Message> = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
+        let role = match entry_type {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+
+        if let Some(text) = extract_message_text(&entry) {
+            // Skip system prompts and XML content for user messages
+            if role == "user"
+                && (text.starts_with('[') || text.starts_with('<') || text.starts_with('/'))
+            {
+                continue;
+            }
+            messages.push(Message {
+                role: role.to_string(),
+                text,
+            });
+        }
+    }
+
+    const CYAN: &str = "\x1b[36m";
+    const YELLOW: &str = "\x1b[33m";
+    const GREEN: &str = "\x1b[32m";
+    const DIM: &str = "\x1b[2m";
+    const BOLD: &str = "\x1b[1m";
+    const RESET: &str = "\x1b[0m";
+
+    let pattern_lower = pattern.to_lowercase();
+    let mut output = String::new();
+    let mut match_count = 0;
+    const MAX_MATCHES: usize = 10; // Fewer matches since we show full context
+
+    output.push_str(&format!(
+        "{}Searching for: \"{}\"{}\n\n",
+        GREEN, pattern, RESET
+    ));
+
+    // Find messages containing the pattern
+    let matching_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.text.to_lowercase().contains(&pattern_lower))
+        .map(|(i, _)| i)
+        .collect();
+
+    // Show each match with surrounding context
+    let mut shown_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for &match_idx in &matching_indices {
+        if match_count >= MAX_MATCHES {
+            output.push_str(&format!("\n{}... more matches truncated{}\n", BOLD, RESET));
+            break;
+        }
+
+        // Skip if we already showed this message as context
+        if shown_indices.contains(&match_idx) {
+            continue;
+        }
+
+        // Separator between match groups
+        if match_count > 0 {
+            output.push_str(&format!(
+                "\n{}════════════════════════════════{}\n\n",
+                DIM, RESET
+            ));
+        }
+
+        // Show previous message (context)
+        if match_idx > 0 && !shown_indices.contains(&(match_idx - 1)) {
+            let prev = &messages[match_idx - 1];
+            output.push_str(&format_context_message(prev, DIM, RESET));
+            output.push_str("\n");
+            shown_indices.insert(match_idx - 1);
+        }
+
+        // Show matching message (highlighted)
+        let msg = &messages[match_idx];
+        output.push_str(&format_matching_message(msg, pattern, CYAN, YELLOW, RESET));
+        shown_indices.insert(match_idx);
+        match_count += 1;
+
+        // Show next message (context)
+        if match_idx + 1 < messages.len() && !shown_indices.contains(&(match_idx + 1)) {
+            output.push_str("\n");
+            let next = &messages[match_idx + 1];
+            output.push_str(&format_context_message(next, DIM, RESET));
+            shown_indices.insert(match_idx + 1);
+        }
+    }
+
+    if match_count == 0 {
+        output.push_str("(no matches in transcript)");
+    } else {
+        output.push_str(&format!(
+            "\n\n{}{} matching messages{}",
+            BOLD, match_count, RESET
+        ));
+    }
+
+    Ok(output)
+}
+
+/// Format a context message (dimmed, truncated if too long)
+fn format_context_message(msg: &Message, dim: &str, reset: &str) -> String {
+    let prefix = if msg.role == "user" { "U" } else { "A" };
+    let max_lines = 10;
+    let lines: Vec<&str> = msg.text.lines().collect();
+
+    let mut output = String::new();
+    for (i, line) in lines.iter().take(max_lines).enumerate() {
+        if i == 0 {
+            output.push_str(&format!("{}{}: {}{}\n", dim, prefix, line, reset));
+        } else {
+            output.push_str(&format!("{}   {}{}\n", dim, line, reset));
+        }
+    }
+    if lines.len() > max_lines {
+        output.push_str(&format!(
+            "{}   ... ({} more lines){}\n",
+            dim,
+            lines.len() - max_lines,
+            reset
+        ));
+    }
+    output
+}
+
+/// Format a matching message (colored, with highlights)
+fn format_matching_message(
+    msg: &Message,
+    pattern: &str,
+    cyan: &str,
+    yellow: &str,
+    reset: &str,
+) -> String {
+    let (prefix, color) = if msg.role == "user" {
+        ("U", cyan)
+    } else {
+        ("A", yellow)
+    };
+
+    let mut output = String::new();
+    for (i, line) in msg.text.lines().enumerate() {
+        let line_lower = line.to_lowercase();
+        let pattern_lower = pattern.to_lowercase();
+
+        let formatted_line = if line_lower.contains(&pattern_lower) {
+            highlight_match(line, pattern)
+        } else {
+            line.to_string()
+        };
+
+        if i == 0 {
+            output.push_str(&format!(
+                "{}{}: {}{}\n",
+                color, prefix, formatted_line, reset
+            ));
+        } else {
+            output.push_str(&format!("{}   {}{}\n", color, formatted_line, reset));
+        }
+    }
+    output
+}
+
+/// Highlight matching text with bold/inverse
+fn highlight_match(text: &str, pattern: &str) -> String {
+    const BOLD: &str = "\x1b[1;7m"; // Bold + inverse
+    const RESET: &str = "\x1b[0m";
+
+    let text_lower = text.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    for (start, _) in text_lower.match_indices(&pattern_lower) {
+        // Add text before match
+        result.push_str(&text[last_end..start]);
+        // Add highlighted match (using original case from text)
+        result.push_str(BOLD);
+        result.push_str(&text[start..start + pattern.len()]);
+        result.push_str(RESET);
+        last_end = start + pattern.len();
+    }
+
+    // Add remaining text
+    result.push_str(&text[last_end..]);
+    result
+}
+
 // =============================================================================
 // Interactive Mode (skim - no external dependencies)
 // =============================================================================
@@ -328,77 +609,119 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use skim::prelude::*;
     use std::process::Command;
 
-    // Get path to current executable for preview
-    let exe_path = std::env::current_exe().context("Could not get executable path")?;
+    let projects_dir = claude_code::get_claude_projects_dir()?;
 
-    // Build preview command that calls ourselves with --preview
-    let preview_cmd = format!("{} --preview {{}}", exe_path.display());
+    // Start with all sessions; may be filtered by transcript search
+    let mut current_sessions: Vec<&Session> = sessions.iter().collect();
+    let mut search_pattern: Option<String> = None;
 
-    let header = if fork {
-        "FORK mode │ Select session to fork"
-    } else {
-        "Select session to resume │ CREAT MOD PROJECT"
-    };
-
-    let options = SkimOptionsBuilder::default()
-        .height(Some("100%"))
-        .preview(Some(&preview_cmd))
-        .preview_window(Some("right:50%:wrap"))
-        .header(Some(header))
-        .prompt(Some("filter> "))
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
-
-    // Create items from sessions
-    let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
-
-    for session in sessions {
-        let item = SessionItem {
-            filepath: session.filepath.clone(),
-            session_id: session.id.clone(),
-            project_path: session.project_path.clone(),
-            display: format!(
-                "{:<6} {:<6} {:<12} {}",
-                format_time_relative(session.created),
-                format_time_relative(session.modified),
-                session.project,
-                format_session_desc(session, 50),
+    loop {
+        let header = match (&search_pattern, fork) {
+            (Some(pat), true) => format!(
+                "FORK │ search: \"{}\" │ ctrl+s: new search │ esc: clear",
+                pat
             ),
+            (Some(pat), false) => format!("search: \"{}\" │ ctrl+s: new search │ esc: clear", pat),
+            (None, true) => "FORK mode │ ctrl+s: transcript search".to_string(),
+            (None, false) => "Select session │ ctrl+s: transcript search".to_string(),
         };
-        let _ = tx.send(Arc::new(item));
-    }
-    drop(tx); // Close sender so skim knows input is complete
 
-    let output = Skim::run_with(&options, Some(rx));
+        let options = SkimOptionsBuilder::default()
+            .height(Some("100%"))
+            .preview(Some(""))
+            .preview_window(Some("right:50%:wrap"))
+            .header(Some(&header))
+            .prompt(Some("filter> "))
+            .bind(vec!["ctrl-s:accept"]) // ctrl+s triggers transcript search
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
 
-    if let Some(out) = output {
-        if out.is_abort {
-            return Ok(());
+        let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
+
+        for session in &current_sessions {
+            let item = SessionItem {
+                filepath: session.filepath.clone(),
+                session_id: session.id.clone(),
+                project_path: session.project_path.clone(),
+                display: format!(
+                    "{:<6} {:<6} {:<12} {}",
+                    format_time_relative(session.created),
+                    format_time_relative(session.modified),
+                    session.project,
+                    format_session_desc(session, 50),
+                ),
+                search_pattern: search_pattern.clone(),
+            };
+            let _ = tx.send(Arc::new(item));
         }
+        drop(tx);
 
-        if let Some(item) = out.selected_items.first() {
-            let session_item = item
-                .as_any()
-                .downcast_ref::<SessionItem>()
-                .context("Failed to get selected session")?;
+        let output = Skim::run_with(&options, Some(rx));
 
-            let action = if fork { "Forking" } else { "Resuming" };
-            println!(
-                "{} session {} in {}",
-                action, session_item.session_id, session_item.project_path
-            );
+        match output {
+            Some(out) if out.is_abort => {
+                // Esc pressed - if searching, clear search; otherwise exit
+                if search_pattern.is_some() {
+                    search_pattern = None;
+                    current_sessions = sessions.iter().collect();
+                    continue;
+                }
+                return Ok(());
+            }
+            Some(out) => {
+                // Check if ctrl+s was pressed (query will be in out.query)
+                let query = out.query.trim();
 
-            // Change to project directory and run claude
-            let fork_flag = if fork { " --fork-session" } else { "" };
-            let cmd = format!(
-                "cd '{}' && claude -r '{}'{}",
-                session_item.project_path, session_item.session_id, fork_flag
-            );
-            Command::new("zsh").args(["-c", &cmd]).status()?;
+                // ctrl+s triggers search if there's a query
+                if out.final_key == Key::Ctrl('s') {
+                    if query.is_empty() {
+                        continue; // No query, just re-show
+                    }
+
+                    // Search transcripts for the query
+                    match claude_code::search_sessions(&projects_dir, query) {
+                        Ok(matched) => {
+                            // Filter to matched session IDs
+                            let matched_ids: std::collections::HashSet<_> =
+                                matched.iter().map(|s| &s.id).collect();
+                            current_sessions = sessions
+                                .iter()
+                                .filter(|s| matched_ids.contains(&s.id))
+                                .collect();
+                            search_pattern = Some(query.to_string());
+                        }
+                        Err(e) => {
+                            eprintln!("Search error: {}", e);
+                        }
+                    }
+                    continue;
+                }
+
+                // Normal selection (Enter)
+                if let Some(item) = out.selected_items.first() {
+                    let session_item = item
+                        .as_any()
+                        .downcast_ref::<SessionItem>()
+                        .context("Failed to get selected session")?;
+
+                    let action = if fork { "Forking" } else { "Resuming" };
+                    println!(
+                        "{} session {} in {}",
+                        action, session_item.session_id, session_item.project_path
+                    );
+
+                    let fork_flag = if fork { " --fork-session" } else { "" };
+                    let cmd = format!(
+                        "cd '{}' && claude -r '{}'{}",
+                        session_item.project_path, session_item.session_id, fork_flag
+                    );
+                    Command::new("zsh").args(["-c", &cmd]).status()?;
+                    return Ok(());
+                }
+            }
+            None => return Ok(()),
         }
     }
-
-    Ok(())
 }
 
 /// Session item for skim display
@@ -407,6 +730,7 @@ struct SessionItem {
     session_id: String,
     project_path: String,
     display: String,
+    search_pattern: Option<String>, // When set, preview shows matching lines
 }
 
 impl SkimItem for SessionItem {
@@ -415,8 +739,15 @@ impl SkimItem for SessionItem {
     }
 
     fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        // Return the filepath for the preview command
-        ItemPreview::Text(self.filepath.to_string_lossy().to_string())
+        // Generate preview content directly (no subprocess needed)
+        let result = match &self.search_pattern {
+            Some(pattern) => generate_search_preview(&self.filepath, pattern),
+            None => generate_preview_content(&self.filepath),
+        };
+        match result {
+            Ok(content) => ItemPreview::AnsiText(content),
+            Err(_) => ItemPreview::Text("(failed to load preview)".to_string()),
+        }
     }
 }
 

@@ -236,7 +236,10 @@ fn read_summary_from_tail(filepath: &Path) -> Option<String> {
     for line in content.lines() {
         if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
             if entry.get("type").and_then(|v| v.as_str()) == Some("summary") {
-                return entry.get("summary").and_then(|v| v.as_str()).map(String::from);
+                return entry
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
             }
         }
     }
@@ -294,7 +297,6 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 ///
 /// Finds sessions containing the pattern and extracts metadata directly
 /// from the matching files (no index dependency).
-#[allow(dead_code)] // Useful for future transcript search feature
 pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
     let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
 
@@ -407,24 +409,40 @@ mod tests {
 
     #[test]
     fn uuid_validation_valid_uuids() {
-        assert!(is_valid_session_uuid("12345678-1234-1234-1234-123456789abc"));
-        assert!(is_valid_session_uuid("abcdef00-abcd-abcd-abcd-abcdef123456"));
-        assert!(is_valid_session_uuid("ABCDEF00-ABCD-ABCD-ABCD-ABCDEF123456"));
+        assert!(is_valid_session_uuid(
+            "12345678-1234-1234-1234-123456789abc"
+        ));
+        assert!(is_valid_session_uuid(
+            "abcdef00-abcd-abcd-abcd-abcdef123456"
+        ));
+        assert!(is_valid_session_uuid(
+            "ABCDEF00-ABCD-ABCD-ABCD-ABCDEF123456"
+        ));
     }
 
     #[test]
     fn uuid_validation_invalid_formats() {
         // Wrong segment lengths
-        assert!(!is_valid_session_uuid("1234567-1234-1234-1234-123456789abc")); // 7 chars
-        assert!(!is_valid_session_uuid("12345678-123-1234-1234-123456789abc")); // 3 chars
-        assert!(!is_valid_session_uuid("12345678-1234-1234-1234-123456789ab")); // 11 chars
+        assert!(!is_valid_session_uuid(
+            "1234567-1234-1234-1234-123456789abc"
+        )); // 7 chars
+        assert!(!is_valid_session_uuid(
+            "12345678-123-1234-1234-123456789abc"
+        )); // 3 chars
+        assert!(!is_valid_session_uuid(
+            "12345678-1234-1234-1234-123456789ab"
+        )); // 11 chars
 
         // Wrong number of segments
         assert!(!is_valid_session_uuid("12345678-1234-1234-123456789abc"));
-        assert!(!is_valid_session_uuid("12345678-1234-1234-1234-1234-123456789abc"));
+        assert!(!is_valid_session_uuid(
+            "12345678-1234-1234-1234-1234-123456789abc"
+        ));
 
         // Non-hex characters
-        assert!(!is_valid_session_uuid("1234567g-1234-1234-1234-123456789abc"));
+        assert!(!is_valid_session_uuid(
+            "1234567g-1234-1234-1234-123456789abc"
+        ));
 
         // Old-style names
         assert!(!is_valid_session_uuid("agent-12345"));
