@@ -282,6 +282,28 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    // Check for required dependencies
+    let missing: Vec<&str> = ["fzf", "jaq"]
+        .into_iter()
+        .filter(|cmd| {
+            Command::new("which")
+                .arg(cmd)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing required dependencies: {}\nInstall with: brew install {}",
+            missing.join(", "),
+            missing.join(" ")
+        );
+    }
+
     // Get path to current executable for search reload
     let exe_path = std::env::current_exe().context("Could not get executable path")?;
 
