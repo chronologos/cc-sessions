@@ -9,48 +9,27 @@
 //! ```text
 //! ~/.claude/projects/
 //!   -Users-you-project-a/
-//!     sessions-index.json    # Metadata for indexed sessions
-//!     abc123.jsonl           # Session transcript
-//!     def456.jsonl
+//!     abc12345-1234-1234-1234-123456789abc.jsonl   # Session transcript (UUID filename)
+//!     def45678-5678-5678-5678-567890123def.jsonl
 //!   -Users-you-project-b/
-//!     sessions-index.json
-//!     ghi789.jsonl
+//!     ghi78901-9012-9012-9012-901234567890.jsonl
 //! ```
+//!
+//! Sessions are discovered by scanning for `.jsonl` files with valid UUID filenames.
+//! Metadata is extracted directly from file contents (head + tail) rather than
+//! relying on `sessions-index.json` which is often stale.
 
-use crate::{Session, SessionSource};
+use crate::Session;
 use anyhow::{Context, Result};
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
 use grep_searcher::sinks::UTF8;
 use rayon::prelude::*;
-use serde::Deserialize;
-use std::collections::HashSet;
-use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
-
-// =============================================================================
-// Claude Code Index Schema
-// =============================================================================
-
-#[derive(Deserialize)]
-pub struct SessionsIndex {
-    pub entries: Vec<IndexEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndexEntry {
-    pub session_id: String,
-    pub full_path: String,
-    pub first_prompt: Option<String>,
-    pub summary: Option<String>,
-    pub custom_title: Option<String>,
-    pub created: Option<String>,
-    pub modified: Option<String>,
-    pub project_path: Option<String>,
-}
 
 // =============================================================================
 // Path Discovery
@@ -65,130 +44,77 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
 // Session Loading
 // =============================================================================
 
+/// Find all sessions by scanning .jsonl files directly.
+///
+/// This replaces the previous two-phase approach (index + orphan) with a single
+/// unified scan. All metadata is extracted directly from file contents.
 pub fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
-    // Find all sessions-index.json files
-    let index_files: Vec<_> = WalkDir::new(projects_dir)
+    // Find all .jsonl files with valid UUID filenames
+    let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
         .min_depth(2)
         .max_depth(2)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name() == "sessions-index.json")
+        .filter(|e| {
+            let path = e.path();
+            // Must be .jsonl file
+            if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
+                return false;
+            }
+            // Skip subagents directory
+            if path.to_string_lossy().contains("/subagents/") {
+                return false;
+            }
+            // Must have valid UUID filename
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(is_valid_session_uuid)
+                .unwrap_or(false)
+        })
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // Track indexed session IDs to find orphans later
-    let mut indexed_ids: HashSet<String> = HashSet::new();
-
-    // Process in parallel with rayon
-    let sessions: Vec<Session> = index_files
+    // Process files in parallel, extracting metadata from each
+    let mut sessions: Vec<Session> = jsonl_files
         .par_iter()
-        .flat_map(|index_path| {
-            let content = fs::read_to_string(index_path).ok()?;
-            let index: SessionsIndex = serde_json::from_str(&content).ok()?;
-
-            Some(
-                index
-                    .entries
-                    .into_iter()
-                    .filter_map(|entry| session_from_index_entry(entry))
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .flatten()
-        .collect();
-
-    // Collect indexed IDs
-    for s in &sessions {
-        indexed_ids.insert(s.id.clone());
-    }
-
-    // Find orphaned .jsonl files (not in any index)
-    let orphaned_sessions: Vec<Session> = WalkDir::new(projects_dir)
-        .min_depth(2)
-        .max_depth(2)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let path = e.path();
-
-            // Filter by extension and skip subagents directory
-            if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
-                return None;
-            }
-            if path.to_string_lossy().contains("/subagents/") {
-                return None;
-            }
-
-            let id = path.file_stem()?.to_string_lossy();
-
-            // Skip indexed and agent-* sessions
-            if indexed_ids.contains(id.as_ref()) || id.starts_with("agent-") {
-                return None;
-            }
-
-            let filepath = path.to_path_buf();
+        .filter_map(|filepath| {
             let parent_dir = filepath
                 .parent()?
                 .file_name()?
                 .to_string_lossy()
                 .to_string();
-            session_from_orphan_file(&filepath, &parent_dir)
+            extract_session_metadata(filepath, &parent_dir)
         })
         .collect();
 
-    let mut sessions = sessions;
-    sessions.extend(orphaned_sessions);
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
 }
 
-/// Create a Session from an IndexEntry
-fn session_from_index_entry(entry: IndexEntry) -> Option<Session> {
-    let filepath = PathBuf::from(&entry.full_path);
-    if !filepath.exists() {
-        return None;
+/// Check if a string is a valid UUID (8-4-4-4-12 format with hex chars)
+fn is_valid_session_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 5 {
+        return false;
     }
-
-    let project_path = entry.project_path.unwrap_or_default();
-    let project = project_path
-        .split('/')
-        .last()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string();
-
-    let created = parse_timestamp(entry.created.as_deref());
-
-    // Use file mtime if newer than index timestamp (index may be stale)
-    let modified = std::cmp::max(
-        parse_timestamp(entry.modified.as_deref()),
-        file_mtime(&filepath),
-    );
-
-    let first_message = entry.first_prompt.as_ref().and_then(|p| {
-        if p == "No prompt" || p.starts_with("[Request") || p.starts_with("/") {
-            None
-        } else {
-            Some(crate::normalize_summary(p, 50))
-        }
-    });
-
-    Some(Session {
-        id: entry.session_id,
-        source: SessionSource::Indexed,
-        project,
-        project_path,
-        filepath,
-        created,
-        modified,
-        first_message,
-        summary: entry.summary,
-        name: entry.custom_title,
-    })
+    if parts[0].len() != 8
+        || parts[1].len() != 4
+        || parts[2].len() != 4
+        || parts[3].len() != 4
+        || parts[4].len() != 12
+    {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Create a Session from an orphaned .jsonl file (no index entry)
-fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option<Session> {
+/// Extract all session metadata from a .jsonl file.
+///
+/// Reads:
+/// - HEAD (first ~50 lines): cwd, first user message
+/// - TAIL (last ~16KB): summary type entry, customTitle field
+/// - Filesystem: created/modified timestamps
+fn extract_session_metadata(filepath: &Path, parent_dir_name: &str) -> Option<Session> {
     let id = filepath.file_stem()?.to_string_lossy().to_string();
 
     // Get timestamps from file metadata
@@ -196,8 +122,11 @@ fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     let created = metadata.created().unwrap_or(modified);
 
-    // Extract project path, first prompt, and summary from file content
-    let (project_path, first_message, summary) = extract_orphan_metadata(filepath);
+    // Extract metadata from file head
+    let (project_path, first_message) = read_file_head(filepath);
+
+    // Extract metadata from file tail (summary, customTitle)
+    let (summary, custom_title) = read_file_tail(filepath);
 
     // Skip "empty" sessions that have no user content
     if project_path.is_empty() && first_message.is_none() && summary.is_none() {
@@ -208,29 +137,25 @@ fn session_from_orphan_file(filepath: &PathBuf, parent_dir_name: &str) -> Option
 
     Some(Session {
         id,
-        source: SessionSource::Orphan,
         project,
         project_path,
-        filepath: filepath.clone(),
+        filepath: filepath.to_path_buf(),
         created,
         modified,
         first_message,
         summary,
-        name: None, // Orphans don't have customTitle
+        name: custom_title,
     })
 }
 
-/// Extract project path, first prompt, and summary from a session JSONL file
-fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Option<String>) {
-    use std::io::{BufRead, BufReader};
-
+/// Read the head of a session file to extract cwd and first user message
+fn read_file_head(filepath: &Path) -> (String, Option<String>) {
     let mut project_path = String::new();
     let mut first_prompt = None;
-    let mut summary = None;
 
-    let file = match fs::File::open(filepath) {
+    let file = match File::open(filepath) {
         Ok(f) => f,
-        Err(_) => return (project_path, first_prompt, summary),
+        Err(_) => return (project_path, first_prompt),
     };
     let reader = BufReader::new(file);
 
@@ -250,13 +175,6 @@ fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Optio
                 }
             }
 
-            // Extract summary from compacted sessions
-            if summary.is_none() && entry_type == Some("summary") {
-                if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
-                    summary = Some(s.to_string());
-                }
-            }
-
             // Extract first user prompt
             if first_prompt.is_none() && entry_type == Some("user") {
                 if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
@@ -270,14 +188,87 @@ fn extract_orphan_metadata(filepath: &PathBuf) -> (String, Option<String>, Optio
                 }
             }
 
-            // Stop early if we have all we need
-            if !project_path.is_empty() && (first_prompt.is_some() || summary.is_some()) {
+            // Stop early if we have both
+            if !project_path.is_empty() && first_prompt.is_some() {
                 break;
             }
         }
     }
 
-    (project_path, first_prompt, summary)
+    (project_path, first_prompt)
+}
+
+/// Read the tail of a session file to extract summary and customTitle
+///
+/// Strategy:
+/// - Summary: Read last 16KB (summaries are always at end of compacted sessions)
+/// - CustomTitle: Use grep to find `custom-title` type entry anywhere in file
+fn read_file_tail(filepath: &Path) -> (Option<String>, Option<String>) {
+    let summary = read_summary_from_tail(filepath);
+    let custom_title = find_custom_title(filepath);
+    (summary, custom_title)
+}
+
+/// Read summary from the tail of the file (last 16KB)
+fn read_summary_from_tail(filepath: &Path) -> Option<String> {
+    const TAIL_SIZE: u64 = 16 * 1024; // 16KB
+
+    let mut file = File::open(filepath).ok()?;
+    let len = file.metadata().ok()?.len();
+
+    // Seek to tail
+    let start = len.saturating_sub(TAIL_SIZE);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+
+    let mut content = String::new();
+    file.read_to_string(&mut content).ok()?;
+
+    // If we seeked mid-file, skip first partial line
+    if start > 0 {
+        if let Some(newline) = content.find('\n') {
+            content = content[newline + 1..].to_string();
+        }
+    }
+
+    // Find summary type entry
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+            if entry.get("type").and_then(|v| v.as_str()) == Some("summary") {
+                return entry.get("summary").and_then(|v| v.as_str()).map(String::from);
+            }
+        }
+    }
+
+    None
+}
+
+/// Find customTitle by grepping the file for "custom-title" type entry
+///
+/// CustomTitle can appear anywhere in the file (when user runs /rename),
+/// so we use grep to efficiently locate it rather than reading the whole file.
+fn find_custom_title(filepath: &Path) -> Option<String> {
+    // Use grep to find custom-title lines efficiently
+    let matcher = RegexMatcher::new_line_matcher(r#""type"\s*:\s*"custom-title""#).ok()?;
+    let mut found_line = None;
+
+    let _ = Searcher::new().search_path(
+        &matcher,
+        filepath,
+        UTF8(|_, line| {
+            found_line = Some(line.to_string());
+            Ok(false) // Stop after first match (there should only be one)
+        }),
+    );
+
+    // Parse the found line to extract customTitle
+    let line = found_line?;
+    let entry: serde_json::Value = serde_json::from_str(&line).ok()?;
+    entry
+        .get("customTitle")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Extract text from message content (string or array of content blocks)
@@ -299,17 +290,30 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 // Transcript Search
 // =============================================================================
 
-/// Search session transcripts for a pattern using grep crates
+/// Search session transcripts for a pattern using grep crates.
+///
+/// Finds sessions containing the pattern and extracts metadata directly
+/// from the matching files (no index dependency).
 pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
     let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
 
-    // Find all .jsonl files
+    // Find all .jsonl files with valid UUID filenames
     let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().extension().is_some_and(|ext| ext == "jsonl")
-                && !e.path().to_string_lossy().contains("/subagents/")
+            let path = e.path();
+            if !path.extension().is_some_and(|ext| ext == "jsonl") {
+                return false;
+            }
+            if path.to_string_lossy().contains("/subagents/") {
+                return false;
+            }
+            // Must have valid UUID filename
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(is_valid_session_uuid)
+                .unwrap_or(false)
         })
         .map(|e| e.path().to_path_buf())
         .collect();
@@ -332,56 +336,19 @@ pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Sess
         .cloned()
         .collect();
 
-    // Load session metadata for matching files
-    let sessions: Vec<Session> = matching_files
+    // Extract metadata directly from matching files
+    let mut sessions: Vec<Session> = matching_files
         .par_iter()
         .filter_map(|filepath| {
-            let session_id = filepath.file_stem()?.to_string_lossy().to_string();
-            let index_path = filepath.parent()?.join("sessions-index.json");
-            let content = fs::read_to_string(&index_path).ok()?;
-            let index: SessionsIndex = serde_json::from_str(&content).ok()?;
-
-            index.entries.into_iter().find_map(|entry| {
-                if entry.session_id != session_id {
-                    return None;
-                }
-
-                let project_path = entry.project_path.unwrap_or_default();
-                let project = project_path
-                    .split('/')
-                    .last()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let created = entry
-                    .created
-                    .as_deref()
-                    .and_then(parse_iso_time)
-                    .unwrap_or(UNIX_EPOCH);
-                let modified = entry
-                    .modified
-                    .as_deref()
-                    .and_then(parse_iso_time)
-                    .unwrap_or(UNIX_EPOCH);
-
-                Some(Session {
-                    id: entry.session_id,
-                    source: SessionSource::Indexed,
-                    project,
-                    project_path,
-                    filepath: filepath.clone(),
-                    created,
-                    modified,
-                    first_message: entry.first_prompt,
-                    summary: entry.summary,
-                    name: entry.custom_title,
-                })
-            })
+            let parent_dir = filepath
+                .parent()?
+                .file_name()?
+                .to_string_lossy()
+                .to_string();
+            extract_session_metadata(filepath, &parent_dir)
         })
         .collect();
 
-    let mut sessions = sessions;
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
 }
@@ -389,62 +356,6 @@ pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Sess
 // =============================================================================
 // Helper Functions
 // =============================================================================
-
-/// Parse ISO 8601 timestamp (Claude Code format: 2026-01-15T06:15:58.913Z)
-pub fn parse_iso_time(s: &str) -> Option<SystemTime> {
-    let s = s.trim_end_matches('Z');
-    let (date, time) = s.split_once('T')?;
-    let date_parts: Vec<&str> = date.split('-').collect();
-    let time_parts: Vec<&str> = time.split(':').collect();
-
-    if date_parts.len() != 3 || time_parts.len() < 2 {
-        return None;
-    }
-
-    let year: i64 = date_parts[0].parse().ok()?;
-    let month: u32 = date_parts[1].parse().ok()?;
-    let day: u32 = date_parts[2].parse().ok()?;
-
-    let hour: u32 = time_parts[0].parse().ok()?;
-    let min: u32 = time_parts[1].parse().ok()?;
-    let sec: f64 = time_parts
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
-
-    // Days from epoch to year
-    let mut days: i64 = 0;
-    for y in 1970..year {
-        days += if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
-        } else {
-            365
-        };
-    }
-
-    // Days from month
-    let month_days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
-    days += month_days[month as usize - 1] as i64;
-    if month > 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-        days += 1;
-    }
-    days += day as i64 - 1;
-
-    let secs = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
-    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
-}
-
-/// Parse optional ISO timestamp string, defaulting to UNIX_EPOCH
-fn parse_timestamp(s: Option<&str>) -> SystemTime {
-    s.and_then(parse_iso_time).unwrap_or(UNIX_EPOCH)
-}
-
-/// Get file modification time, defaulting to UNIX_EPOCH on error
-fn file_mtime(path: &PathBuf) -> SystemTime {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or(UNIX_EPOCH)
-}
 
 /// Extract project name from path or directory name fallback
 ///
@@ -490,114 +401,34 @@ mod tests {
     use super::*;
 
     // =========================================================================
-    // parse_iso_time - Critical for session sorting
+    // UUID validation - Critical for filtering non-session files
     // =========================================================================
 
     #[test]
-    fn parse_iso_time_standard_format() {
-        let result = parse_iso_time("2026-01-15T06:15:58.913Z");
-        assert!(result.is_some());
-
-        let secs = result
-            .unwrap()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let year_2025 = 55 * 365 * 86400;
-        let year_2027 = 57 * 365 * 86400;
-        assert!(secs > year_2025 && secs < year_2027);
+    fn uuid_validation_valid_uuids() {
+        assert!(is_valid_session_uuid("12345678-1234-1234-1234-123456789abc"));
+        assert!(is_valid_session_uuid("abcdef00-abcd-abcd-abcd-abcdef123456"));
+        assert!(is_valid_session_uuid("ABCDEF00-ABCD-ABCD-ABCD-ABCDEF123456"));
     }
 
     #[test]
-    fn parse_iso_time_without_milliseconds() {
-        let result = parse_iso_time("2026-01-15T06:15:58Z");
-        assert!(result.is_some());
-    }
+    fn uuid_validation_invalid_formats() {
+        // Wrong segment lengths
+        assert!(!is_valid_session_uuid("1234567-1234-1234-1234-123456789abc")); // 7 chars
+        assert!(!is_valid_session_uuid("12345678-123-1234-1234-123456789abc")); // 3 chars
+        assert!(!is_valid_session_uuid("12345678-1234-1234-1234-123456789ab")); // 11 chars
 
-    #[test]
-    fn parse_iso_time_ordering_preserved() {
-        let earlier = parse_iso_time("2026-01-15T06:00:00Z").unwrap();
-        let later = parse_iso_time("2026-01-15T07:00:00Z").unwrap();
-        assert!(earlier < later);
+        // Wrong number of segments
+        assert!(!is_valid_session_uuid("12345678-1234-1234-123456789abc"));
+        assert!(!is_valid_session_uuid("12345678-1234-1234-1234-1234-123456789abc"));
 
-        let day1 = parse_iso_time("2026-01-15T12:00:00Z").unwrap();
-        let day2 = parse_iso_time("2026-01-16T12:00:00Z").unwrap();
-        assert!(day1 < day2);
-    }
+        // Non-hex characters
+        assert!(!is_valid_session_uuid("1234567g-1234-1234-1234-123456789abc"));
 
-    #[test]
-    fn parse_iso_time_leap_year() {
-        let result = parse_iso_time("2024-02-29T12:00:00Z");
-        assert!(result.is_some());
-
-        let feb29 = parse_iso_time("2024-02-29T12:00:00Z").unwrap();
-        let mar1 = parse_iso_time("2024-03-01T12:00:00Z").unwrap();
-        let diff = mar1.duration_since(feb29).unwrap().as_secs();
-        assert_eq!(diff, 86400);
-    }
-
-    #[test]
-    fn parse_iso_time_invalid_formats() {
-        assert!(parse_iso_time("not a date").is_none());
-        assert!(parse_iso_time("2026-01-15").is_none());
-        assert!(parse_iso_time("06:15:58Z").is_none());
-        assert!(parse_iso_time("").is_none());
-    }
-
-    // =========================================================================
-    // IndexEntry deserialization
-    // =========================================================================
-
-    #[test]
-    fn index_entry_deserialize_full() {
-        let json = r#"{
-            "sessionId": "abc-123",
-            "fullPath": "/home/user/.claude/sessions/abc.jsonl",
-            "firstPrompt": "Hello world",
-            "summary": "Test summary",
-            "created": "2026-01-15T06:00:00Z",
-            "modified": "2026-01-15T07:00:00Z",
-            "projectPath": "/home/user/my-project"
-        }"#;
-
-        let entry: IndexEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.session_id, "abc-123");
-        assert_eq!(entry.full_path, "/home/user/.claude/sessions/abc.jsonl");
-        assert_eq!(entry.first_prompt, Some("Hello world".to_string()));
-        assert_eq!(entry.summary, Some("Test summary".to_string()));
-        assert_eq!(
-            entry.project_path,
-            Some("/home/user/my-project".to_string())
-        );
-    }
-
-    #[test]
-    fn index_entry_deserialize_minimal() {
-        let json = r#"{
-            "sessionId": "abc-123",
-            "fullPath": "/path/to/session.jsonl"
-        }"#;
-
-        let entry: IndexEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.session_id, "abc-123");
-        assert!(entry.first_prompt.is_none());
-        assert!(entry.summary.is_none());
-        assert!(entry.project_path.is_none());
-    }
-
-    #[test]
-    fn sessions_index_deserialize() {
-        let json = r#"{
-            "entries": [
-                {"sessionId": "sess-1", "fullPath": "/path/1.jsonl"},
-                {"sessionId": "sess-2", "fullPath": "/path/2.jsonl"}
-            ]
-        }"#;
-
-        let index: SessionsIndex = serde_json::from_str(json).unwrap();
-        assert_eq!(index.entries.len(), 2);
-        assert_eq!(index.entries[0].session_id, "sess-1");
-        assert_eq!(index.entries[1].session_id, "sess-2");
+        // Old-style names
+        assert!(!is_valid_session_uuid("agent-12345"));
+        assert!(!is_valid_session_uuid("black-knight-battle"));
+        assert!(!is_valid_session_uuid("sessions-index"));
     }
 
     // =========================================================================
@@ -636,55 +467,50 @@ mod tests {
     // Integration tests with fake data
     // =========================================================================
 
+    /// Helper to generate a valid UUID for test files
+    fn test_uuid(n: u8) -> String {
+        format!(
+            "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            n as u32, n as u16, n as u16, n as u16, n as u64
+        )
+    }
+
     #[test]
-    fn find_sessions_with_fake_data() {
+    fn find_sessions_with_uuid_files() {
         let temp_dir = std::env::temp_dir().join(format!("cc-session-test-{}", std::process::id()));
         let project_dir = temp_dir.join("-Users-sirrobin-holy-grail");
         fs::create_dir_all(&project_dir).unwrap();
 
-        let session1_path = project_dir.join("black-knight-battle.jsonl");
-        let session2_path = project_dir.join("killer-rabbit-encounter.jsonl");
+        let uuid1 = test_uuid(1);
+        let uuid2 = test_uuid(2);
+
+        let session1_path = project_dir.join(format!("{}.jsonl", uuid1));
+        let session2_path = project_dir.join(format!("{}.jsonl", uuid2));
+
+        // Session with cwd and user message
         fs::write(
             &session1_path,
-            r#"{"type":"user","message":"Tis but a scratch"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"Tis but a scratch"},"cwd":"/Users/sirrobin/holy-grail"}"#,
         )
         .unwrap();
-        fs::write(&session2_path, r#"{"type":"user","message":"Run away!"}"#).unwrap();
 
-        let index_json = format!(
-            r#"{{
-                "entries": [
-                    {{
-                        "sessionId": "black-knight-battle",
-                        "fullPath": "{}",
-                        "projectPath": "/Users/sirrobin/holy-grail",
-                        "summary": "Losing limbs but staying positive",
-                        "created": "1975-04-03T10:00:00Z",
-                        "modified": "1975-04-03T11:00:00Z"
-                    }},
-                    {{
-                        "sessionId": "killer-rabbit-encounter",
-                        "fullPath": "{}",
-                        "projectPath": "/Users/sirrobin/holy-grail",
-                        "summary": "Deploying Holy Hand Grenade of Antioch",
-                        "created": "1975-04-03T14:00:00Z",
-                        "modified": "1975-04-03T15:00:00Z"
-                    }}
-                ]
-            }}"#,
-            session1_path.display(),
-            session2_path.display()
-        );
-        fs::write(project_dir.join("sessions-index.json"), index_json).unwrap();
+        // Session with summary in tail
+        fs::write(
+            &session2_path,
+            r#"{"type":"user","message":{"role":"user","content":"Run away!"},"cwd":"/Users/sirrobin/holy-grail"}
+{"type":"summary","summary":"Deploying Holy Hand Grenade of Antioch"}"#,
+        )
+        .unwrap();
 
         let sessions = find_sessions(&temp_dir).unwrap();
 
         assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].id, "killer-rabbit-encounter");
-        assert_eq!(sessions[1].id, "black-knight-battle");
         assert_eq!(sessions[0].project, "holy-grail");
+
+        // Find session with summary
+        let with_summary = sessions.iter().find(|s| s.summary.is_some()).unwrap();
         assert_eq!(
-            sessions[0].summary,
+            with_summary.summary,
             Some("Deploying Holy Hand Grenade of Antioch".to_string())
         );
 
@@ -692,182 +518,87 @@ mod tests {
     }
 
     #[test]
-    fn find_sessions_filters_missing_files() {
+    fn find_sessions_filters_non_uuid_files() {
         let temp_dir =
-            std::env::temp_dir().join(format!("cc-session-test-parrot-{}", std::process::id()));
-        let project_dir = temp_dir.join("-Users-shopkeeper-ministry-of-silly-walks");
+            std::env::temp_dir().join(format!("cc-session-test-filter-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-arthur-camelot");
         fs::create_dir_all(&project_dir).unwrap();
 
-        let resting_parrot = project_dir.join("resting-parrot.jsonl");
+        let valid_uuid = test_uuid(42);
+
+        // Valid UUID file - should be found
+        let valid_path = project_dir.join(format!("{}.jsonl", valid_uuid));
         fs::write(
-            &resting_parrot,
-            r#"{"type":"user","message":"Beautiful plumage!"}"#,
+            &valid_path,
+            r#"{"type":"user","message":{"role":"user","content":"What is your quest?"},"cwd":"/Users/arthur/camelot"}"#,
         )
         .unwrap();
 
-        let index_json = format!(
-            r#"{{
-                "entries": [
-                    {{
-                        "sessionId": "resting-parrot",
-                        "fullPath": "{}",
-                        "projectPath": "/Users/shopkeeper/ministry-of-silly-walks",
-                        "summary": "Pining for the fjords"
-                    }},
-                    {{
-                        "sessionId": "ex-parrot",
-                        "fullPath": "/nonexistent/this/parrot/has/ceased/to/be.jsonl",
-                        "projectPath": "/Users/shopkeeper/ministry-of-silly-walks",
-                        "summary": "Has joined the choir invisible"
-                    }}
-                ]
-            }}"#,
-            resting_parrot.display()
-        );
-        fs::write(project_dir.join("sessions-index.json"), index_json).unwrap();
+        // Non-UUID files - should be filtered out
+        fs::write(
+            project_dir.join("agent-12345.jsonl"),
+            r#"{"type":"user","message":"I am an agent"}"#,
+        )
+        .unwrap();
+        fs::write(
+            project_dir.join("black-knight.jsonl"),
+            r#"{"type":"user","message":"None shall pass"}"#,
+        )
+        .unwrap();
 
         let sessions = find_sessions(&temp_dir).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "resting-parrot");
-        assert_eq!(
-            sessions[0].summary,
-            Some("Pining for the fjords".to_string())
-        );
+        assert_eq!(sessions[0].id, valid_uuid);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
-    fn find_sessions_handles_corrupted_index() {
+    fn find_sessions_extracts_custom_title_from_tail() {
         let temp_dir =
-            std::env::temp_dir().join(format!("cc-session-test-ni-{}", std::process::id()));
-        let knights_dir = temp_dir.join("-Users-knight-shrubbery");
-        let good_dir = temp_dir.join("-Users-arthur-camelot");
-        fs::create_dir_all(&knights_dir).unwrap();
-        fs::create_dir_all(&good_dir).unwrap();
+            std::env::temp_dir().join(format!("cc-session-test-title-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-brian-life");
+        fs::create_dir_all(&project_dir).unwrap();
 
+        let uuid = test_uuid(99);
+        let session_path = project_dir.join(format!("{}.jsonl", uuid));
+
+        // Session with customTitle from /rename command
+        // The real format is {"type":"custom-title","customTitle":"...","sessionId":"..."}
         fs::write(
-            knights_dir.join("sessions-index.json"),
-            "NI! NI! NI! We demand a shrubbery!",
-        )
-        .unwrap();
-
-        let quest_path = good_dir.join("seek-holy-grail.jsonl");
-        fs::write(
-            &quest_path,
-            r#"{"type":"user","message":"What is your quest?"}"#,
-        )
-        .unwrap();
-        let good_index = format!(
-            r#"{{
-                "entries": [{{
-                    "sessionId": "seek-holy-grail",
-                    "fullPath": "{}",
-                    "projectPath": "/Users/arthur/camelot",
-                    "summary": "To seek the Holy Grail"
-                }}]
-            }}"#,
-            quest_path.display()
-        );
-        fs::write(good_dir.join("sessions-index.json"), good_index).unwrap();
-
-        let sessions = find_sessions(&temp_dir).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "seek-holy-grail");
-
-        fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    #[test]
-    fn find_sessions_discovers_orphaned_files() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "cc-session-test-inquisition-{}",
-            std::process::id()
-        ));
-        let inquisition_dir = temp_dir.join("-Users-cardinal-inquisition");
-        fs::create_dir_all(&inquisition_dir).unwrap();
-
-        let orphan_session = inquisition_dir.join("unexpected-session.jsonl");
-        fs::write(
-            &orphan_session,
-            r#"{"type":"user","message":{"role":"user","content":"Nobody expects the Spanish Inquisition!"},"cwd":"/Users/cardinal/inquisition"}"#,
-        )
-        .unwrap();
-
-        fs::write(
-            inquisition_dir.join("sessions-index.json"),
-            r#"{"entries": []}"#,
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"Always look on the bright side"},"cwd":"/Users/brian/life"}
+{"type":"assistant","message":"Indeed!"}
+{"type":"custom-title","customTitle":"Important Session","sessionId":"00000063-0063-0063-0063-000000000063"}"#,
         )
         .unwrap();
 
         let sessions = find_sessions(&temp_dir).unwrap();
 
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "unexpected-session");
-        assert_eq!(sessions[0].project, "inquisition");
-        assert_eq!(sessions[0].project_path, "/Users/cardinal/inquisition");
-        assert!(sessions[0].summary.is_none());
-        assert_eq!(
-            sessions[0].first_message,
-            Some("Nobody expects the Spanish Inquisition!".to_string())
-        );
+        assert_eq!(sessions[0].name, Some("Important Session".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
-    fn find_sessions_merges_indexed_and_orphaned() {
+    fn find_sessions_handles_empty_sessions() {
         let temp_dir =
-            std::env::temp_dir().join(format!("cc-session-test-realm-{}", std::process::id()));
-        let realm_dir = temp_dir.join("-Users-arthur-realm");
-        fs::create_dir_all(&realm_dir).unwrap();
+            std::env::temp_dir().join(format!("cc-session-test-empty-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-spam-eggs");
+        fs::create_dir_all(&project_dir).unwrap();
 
-        let indexed_session = realm_dir.join("indexed-quest.jsonl");
-        fs::write(
-            &indexed_session,
-            r#"{"type":"user","message":"I seek the grail"}"#,
-        )
-        .unwrap();
+        let uuid = test_uuid(7);
+        let session_path = project_dir.join(format!("{}.jsonl", uuid));
 
-        let orphan_session = realm_dir.join("orphan-quest.jsonl");
-        fs::write(
-            &orphan_session,
-            r#"{"type":"user","message":{"role":"user","content":"A wild quest appears!"},"cwd":"/Users/arthur/realm"}"#,
-        )
-        .unwrap();
-
-        let index_json = format!(
-            r#"{{
-                "entries": [{{
-                    "sessionId": "indexed-quest",
-                    "fullPath": "{}",
-                    "projectPath": "/Users/arthur/realm",
-                    "summary": "The indexed quest",
-                    "modified": "1975-04-03T10:00:00Z"
-                }}]
-            }}"#,
-            indexed_session.display()
-        );
-        fs::write(realm_dir.join("sessions-index.json"), index_json).unwrap();
+        // Empty session with no cwd, no user message, no summary
+        fs::write(&session_path, r#"{"type":"init"}"#).unwrap();
 
         let sessions = find_sessions(&temp_dir).unwrap();
 
-        assert_eq!(sessions.len(), 2);
-
-        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"indexed-quest"));
-        assert!(ids.contains(&"orphan-quest"));
-
-        let indexed = sessions.iter().find(|s| s.id == "indexed-quest").unwrap();
-        assert_eq!(indexed.summary, Some("The indexed quest".to_string()));
-
-        let orphan = sessions.iter().find(|s| s.id == "orphan-quest").unwrap();
-        assert!(orphan.summary.is_none());
-        assert_eq!(
-            orphan.first_message,
-            Some("A wild quest appears!".to_string())
-        );
+        // Empty sessions should be filtered out
+        assert_eq!(sessions.len(), 0);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

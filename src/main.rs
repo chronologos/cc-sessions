@@ -42,16 +42,9 @@ struct Args {
 // Session Model (abstraction layer)
 // =============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SessionSource {
-    Indexed,
-    Orphan,
-}
-
 #[derive(Debug)]
 pub struct Session {
     pub id: String,
-    pub source: SessionSource,
     pub project: String,
     pub project_path: String,
     pub filepath: PathBuf,
@@ -118,42 +111,29 @@ fn main() -> Result<()> {
 fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
     if debug {
         println!(
-            "{:<6} {:<6} {:<8} {:<16} {}",
-            "CREAT", "MOD", "SOURCE", "PROJECT", "SUMMARY"
+            "{:<6} {:<6} {:<16} {:<40} {}",
+            "CREAT", "MOD", "PROJECT", "ID", "SUMMARY"
         );
-        println!("{}", "─".repeat(100));
+        println!("{}", "─".repeat(110));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
-            let source = match session.source {
-                SessionSource::Indexed => "index",
-                SessionSource::Orphan => "orphan",
+            let id_short = if session.id.len() > 36 {
+                &session.id[..36]
+            } else {
+                &session.id
             };
-            let desc = format_session_desc(session, 45);
+            let desc = format_session_desc(session, 35);
 
             println!(
-                "{:<6} {:<6} {:<8} {:<16} {}",
-                created, modified, source, session.project, desc
+                "{:<6} {:<6} {:<16} {:<40} {}",
+                created, modified, session.project, id_short, desc
             );
         }
 
-        // Show stats
-        let indexed = sessions
-            .iter()
-            .filter(|s| s.source == SessionSource::Indexed)
-            .count();
-        let orphans = sessions
-            .iter()
-            .filter(|s| s.source == SessionSource::Orphan)
-            .count();
-        println!("{}", "─".repeat(100));
-        println!(
-            "Total: {} (indexed: {}, orphans: {})",
-            sessions.len(),
-            indexed,
-            orphans
-        );
+        println!("{}", "─".repeat(110));
+        println!("Total: {} sessions", sessions.len());
     } else {
         println!(
             "{:<6} {:<6} {:<16} {}",
