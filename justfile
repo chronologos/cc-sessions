@@ -1,0 +1,45 @@
+# cc-session justfile
+
+# Default recipe - show available commands
+default:
+    @just --list
+
+# Build release binary
+build:
+    cargo build --release
+
+# Run tests
+test:
+    cargo test
+
+# Build and install to ~/.local/bin
+install: build
+    cp target/release/cc-session ~/.local/bin/
+
+# Run with arguments (e.g., just run -- -i)
+run *ARGS:
+    cargo run --release -- {{ARGS}}
+
+# Check code without building
+check:
+    cargo check
+
+# Format code
+fmt:
+    cargo fmt
+
+# Lint with clippy
+lint:
+    cargo clippy -- -D warnings
+
+# Clean build artifacts
+clean:
+    cargo clean
+
+# Watch for changes and run tests
+watch-test:
+    cargo watch -x test
+
+# Watch for changes and check
+watch:
+    cargo watch -x check
