@@ -2,6 +2,8 @@
 
 A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) sessions across all projects.
 
+![Interactive mode with transcript preview](preview.png)
+
 ## Installation
 
 ### Pre-built binary (macOS ARM64)
@@ -54,7 +56,9 @@ CREAT  MOD    PROJECT          SUMMARY
 
 - **Fuzzy search** through project names and summaries
 - **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
+- **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
 - **Enter** to resume session in the original project directory
+- **esc** clears search filter, or exits if no filter active
 - Use `-f` to fork instead of resume (creates new session ID)
 
 ## Features
