@@ -29,11 +29,11 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 ```bash
 cc-sessions              # List 15 most recent sessions
 cc-sessions -c 30        # List 30 sessions
-cc-sessions -i           # Interactive fzf picker with transcript preview
+cc-sessions -i           # Interactive picker with transcript preview
 cc-sessions -f           # Fork a session (creates new session ID)
 cc-sessions -i -f        # Interactive mode + fork
 cc-sessions -p dotfiles  # Filter by project name (case-insensitive)
-cc-sessions --debug      # Show session source (indexed/orphan) and stats
+cc-sessions --debug      # Show session IDs and stats
 ```
 
 ### List mode
@@ -52,34 +52,26 @@ CREAT  MOD    PROJECT          SUMMARY
 
 ### Interactive mode (`-i`)
 
-- **Fuzzy search** through project names, summaries, and transcript metadata
+- **Fuzzy search** through project names and summaries
 - **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
-- **Hybrid search**: `ctrl-s` for full-text transcript search, `ctrl-n` for normal filter
 - **Enter** to resume session in the original project directory
 - Use `-f` to fork instead of resume (creates new session ID)
 
 ## Features
 
-- **Orphan detection**: Finds sessions not yet indexed by Claude Code (shown as "orphan" in `--debug` mode)
+- **Zero runtime dependencies**: Interactive mode uses embedded [skim](https://github.com/lotabout/skim) (no fzf/jaq needed)
 - **Session names**: Shows `★ name` for sessions renamed with `/rename`
-- **Stale timestamp fix**: Uses file mtime when newer than index timestamp
+- **Direct file scanning**: Reads session metadata directly from `.jsonl` files
 - **Parallel processing**: Uses rayon for fast scanning across many projects
-
-## Requirements
-
-- **Runtime**: `fzf` and `jaq` (for interactive mode preview)
-  ```bash
-  brew install fzf jaq
-  ```
 
 ## How it works
 
 Claude Code stores session data in `~/.claude/projects/`. This tool:
 
-1. Reads `sessions-index.json` files from each project directory
-2. Discovers orphan `.jsonl` files not yet in the index
-3. Extracts metadata: session ID, project path, summary, timestamps, custom name
-4. Filters out stale entries and empty sessions
+1. Scans for `.jsonl` files with valid UUID filenames
+2. Extracts metadata directly from file contents (cwd, first message, summary, custom title)
+3. Uses filesystem timestamps for accurate sorting
+4. Filters out empty sessions and non-session files
 
 When you select a session:
 - **Resume** (`-r`): Continues the existing session

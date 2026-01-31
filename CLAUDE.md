@@ -11,13 +11,22 @@ cp target/release/cc-session ~/bin/cc-sessions
 xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions  # macOS
 ```
 
+Or use the justfile:
+
+```bash
+just build    # Build release binary
+just test     # Run tests
+just install  # Build and install to ~/.local/bin
+just lint     # Run clippy
+```
+
 ## Architecture
 
 ### Code Organization
 
 ```
 src/
-  main.rs         # CLI, display, fzf - general/timeless code
+  main.rs         # CLI, display, skim - general/timeless code
   claude_code.rs  # Session loading, JSONL parsing - format-specific
 ```
 
@@ -25,65 +34,21 @@ src/
 
 | Module | Responsibility | Changes when... |
 |--------|---------------|-----------------|
-| `main.rs` | CLI args, display formatting, fzf integration | UI/UX requirements change |
-| `claude_code.rs` | Index parsing, JSONL reading, path discovery | Claude Code format changes |
+| `main.rs` | CLI args, display formatting, skim integration | UI/UX requirements change |
+| `claude_code.rs` | JSONL reading, metadata extraction, path discovery | Claude Code format changes |
 
 ### Session Storage Structure
 
-```mermaid
-graph TB
-    subgraph "~/.claude/"
-        H[history.jsonl<br/><i>prompt history</i>]
-        subgraph "projects/"
-            subgraph "-Users-you-project-a/"
-                IA[sessions-index.json]
-                S1[abc123.jsonl]
-                S2[def456.jsonl]
-            end
-            subgraph "-Users-you-project-b/"
-                IB[sessions-index.json]
-                S3[ghi789.jsonl]
-            end
-        end
-    end
-
-    IA -->|fullPath| S1
-    IA -->|fullPath| S2
-    IB -->|fullPath| S3
-
-    style IA fill:#f9f,stroke:#333
-    style IB fill:#f9f,stroke:#333
-    style S1 fill:#bbf,stroke:#333
-    style S2 fill:#bbf,stroke:#333
-    style S3 fill:#bbf,stroke:#333
+```
+~/.claude/projects/
+  -Users-you-project-a/
+    abc12345-1234-1234-1234-123456789abc.jsonl   # Session transcript (UUID filename)
+    def45678-5678-5678-5678-567890123def.jsonl
+  -Users-you-project-b/
+    ghi78901-9012-9012-9012-901234567890.jsonl
 ```
 
-### sessions-index.json Format
-
-```mermaid
-classDiagram
-    class SessionsIndex {
-        version: 1
-        entries: IndexEntry[]
-    }
-    class IndexEntry {
-        sessionId: string
-        fullPath: string
-        projectPath: string
-        firstPrompt: string
-        summary: string?
-        customTitle: string?
-        created: ISO8601
-        modified: ISO8601
-        fileMtime: epoch_ms
-        messageCount: number
-        gitBranch: string
-        isSidechain: boolean
-    }
-    SessionsIndex "1" *-- "*" IndexEntry
-
-    style IndexEntry fill:#f9f
-```
+Sessions are identified by UUID filenames. Non-UUID files (like `agent-*`) are filtered out.
 
 ### Session JSONL Message Types
 
@@ -104,8 +69,8 @@ flowchart LR
 
     subgraph "Other Entry Types"
         SUM[summary]
+        CT[custom-title]
         SYS[system]
-        FHS[file-history-snapshot]
     end
 
     U1 -.-> UM
@@ -115,54 +80,68 @@ flowchart LR
 ## Implementation Details
 
 ### Session Discovery
-- Reads `sessions-index.json` files from `~/.claude/projects/*/`
-- Each index contains session metadata: id, projectPath, firstPrompt, created, modified
-- Filters out sessions where the `.jsonl` file no longer exists
-- Uses `rayon` for parallel processing of index files
 
-### Orphan Detection
-Sessions not yet indexed by Claude Code are discovered by scanning `.jsonl` files:
-- Compares indexed session IDs with actual `.jsonl` files in each project directory
-- Extracts metadata directly from orphan files: `cwd` (project path), first user message, summary
-- Filters out:
-  - `agent-*` files (subagent sessions spawned by Task tool)
-  - Empty sessions (only `file-history-snapshot` entries, no user content)
-  - XML-tagged system content in first message (`<command-message>`, `<local-command-caveat>`)
-- Falls back to parsing directory name for project when `cwd` unavailable
+All metadata is extracted directly from `.jsonl` files (no index dependency):
 
-**Debug mode (`--debug`):** Shows session source (indexed vs orphan) and statistics
+1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
+2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
+3. **Extract** metadata from file head + tail:
+   - **HEAD** (first ~50 lines): `cwd` field → project path, first `user` message
+   - **TAIL** (last ~16KB): `summary` type entry, `custom-title` entry
+4. **Timestamps** from filesystem (created, modified)
+5. **Filter out** empty sessions (no cwd, no user message, no summary)
 
-### Timestamp Handling
-- Index timestamps may be stale if Claude Code hasn't re-indexed
-- Uses `max(index_modified, file_mtime)` for accurate sorting
-- Created time comes from index or file metadata
+Uses `rayon` for parallel processing across files.
+
+### UUID Validation
+
+Session filenames must match UUID format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`
+
+This filters out:
+- `agent-*` files (subagent sessions spawned by Task tool)
+- Other non-session files
+
+### Metadata Extraction
+
+| Field | Source | Location |
+|-------|--------|----------|
+| `project_path` | `cwd` field | File head |
+| `first_message` | First `user` entry | File head |
+| `summary` | `summary` type entry | File tail (16KB) |
+| `name` (customTitle) | `custom-title` entry | Grep entire file |
+| `created` | Filesystem | `metadata.created()` |
+| `modified` | Filesystem | `metadata.modified()` |
+
+**Why grep for customTitle?** The `/rename` command can be invoked at any point in a session, so `custom-title` entries can appear anywhere in the file, not just the tail.
 
 ### Session Names (customTitle)
 - Set via `/rename` command in Claude Code
+- Stored as `{"type":"custom-title","customTitle":"...","sessionId":"..."}`
 - Displayed with `★` prefix: `★ name - summary`
 - Indicates user-marked important sessions
 
-### Data Source
-Claude Code maintains `sessions-index.json` in each project directory.
-
-**Fields cc-sessions reads:** sessionId, fullPath, projectPath, firstPrompt, summary, customTitle, created, modified
-
-**Fields cc-sessions ignores:** fileMtime, messageCount, gitBranch, isSidechain, version
-
-Note: The index may contain stale entries for deleted sessions. We filter these by checking if `fullPath` exists.
-
 ### Interactive Mode
-- Pipes session list to fzf with tab-delimited fields
-- Preview runs `jaq` to extract conversation transcript from `.jsonl` files
-- On selection, spawns `zsh -c "cd <project> && claude -r <session-id>"`
 
-**Hybrid Search (ctrl-s / ctrl-n):**
-- `ctrl-s`: Switch to **search mode** - full-text search across all session transcripts using ripgrep
-- `ctrl-n`: Switch to **normal mode** - fuzzy filter by project name and summary
-- In search mode, preview shows matching context with highlighting
-- Search is live - results update as you type (~100-200ms latency)
+Uses embedded [skim](https://github.com/lotabout/skim) crate (no external fzf dependency):
+
+1. Build `SkimOptions` with preview command pointing to self
+2. Send `SessionItem`s through crossbeam channel
+3. Preview calls `cc-session --preview <filepath>` to format transcript
+4. On selection, spawns `zsh -c "cd <project> && claude -r <session-id>"`
+
+The `--preview` flag is internal: it reads a `.jsonl` file and outputs color-coded transcript lines.
 
 ## Dependencies
 
-- **Runtime**: `fzf` and `jaq` (for interactive mode preview)
-- **Build**: Rust 1.85+ (edition 2024), rayon for parallelism
+- **Build**: Rust 1.85+ (edition 2024)
+- **Runtime**: None (skim is embedded, preview is self-contained)
+
+### Key crates
+
+| Crate | Purpose |
+|-------|---------|
+| `skim` | Embedded fuzzy finder (replaces fzf) |
+| `rayon` | Parallel file processing |
+| `grep-regex`, `grep-searcher` | Fast pattern matching for customTitle |
+| `serde_json` | JSONL parsing |
+| `clap` | CLI argument parsing |
