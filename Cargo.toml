@@ -1,6 +1,6 @@
 [package]
 name = "cc-session"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.85"
 
@@ -15,6 +15,7 @@ rayon = "1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+skim = "0.10"
 
 [profile.release]
 lto = true

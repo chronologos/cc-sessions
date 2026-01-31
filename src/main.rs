@@ -2,7 +2,8 @@ mod claude_code;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::fs;
+use skim::prelude::*;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -17,7 +18,7 @@ struct Args {
     #[arg(short, long, default_value = "15")]
     count: usize,
 
-    /// Interactive mode with fzf
+    /// Interactive mode
     #[arg(short, long)]
     interactive: bool,
 
@@ -29,9 +30,9 @@ struct Args {
     #[arg(short, long)]
     project: Option<String>,
 
-    /// Search transcript contents (used internally by interactive mode)
-    #[arg(short, long)]
-    search: Option<String>,
+    /// Preview a session file (internal use by interactive mode)
+    #[arg(long, value_name = "FILE")]
+    preview: Option<PathBuf>,
 
     /// Debug mode - show where sessions come from
     #[arg(long)]
@@ -61,23 +62,17 @@ pub struct Session {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Preview mode: output formatted transcript for a session file
+    if let Some(ref filepath) = args.preview {
+        print_session_preview(filepath)?;
+        return Ok(());
+    }
+
     let projects_dir = claude_code::get_claude_projects_dir()?;
 
     if !projects_dir.exists() {
         anyhow::bail!("No Claude sessions found at {:?}", projects_dir);
-    }
-
-    // Search mode: find sessions matching pattern and output for fzf
-    if let Some(ref pattern) = args.search {
-        if pattern.is_empty() {
-            // Empty pattern: return all sessions in fzf format
-            let sessions = claude_code::find_sessions(&projects_dir)?;
-            print_sessions_fzf(&sessions);
-        } else {
-            let sessions = claude_code::search_sessions(&projects_dir, pattern)?;
-            print_sessions_fzf(&sessions);
-        }
-        return Ok(());
     }
 
     let mut sessions = claude_code::find_sessions(&projects_dir)?;
@@ -157,31 +152,6 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
     }
 }
 
-/// Print sessions in fzf-compatible tab-delimited format
-fn print_sessions_fzf(sessions: &[Session]) {
-    for s in sessions.iter().take(50) {
-        println!("{}", format_session_fzf(s));
-    }
-}
-
-/// Format a single session for fzf (tab-delimited)
-fn format_session_fzf(s: &Session) -> String {
-    let modified = format_time_relative(s.modified);
-    let created = format_time_relative(s.created);
-    let desc = format_session_desc(s, 50);
-    format!(
-        "{}\t{}\t{}\t{}\t{:<6} {:<6} {:<12} {}",
-        s.filepath.display(),
-        s.id,
-        s.project_path,
-        s.summary.as_deref().unwrap_or(""),
-        created,
-        modified,
-        s.project,
-        desc
-    )
-}
-
 fn format_time_relative(time: SystemTime) -> String {
     let now = SystemTime::now();
     let duration = now.duration_since(time).unwrap_or_default();
@@ -255,122 +225,199 @@ pub fn normalize_summary(text: &str, max_chars: usize) -> String {
 }
 
 // =============================================================================
-// Interactive Mode (fzf integration)
+// Preview Mode (internal, replaces jaq dependency)
+// =============================================================================
+
+/// Print formatted transcript preview for a session file.
+/// Used internally by skim's preview command.
+fn print_session_preview(filepath: &PathBuf) -> Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = File::open(filepath).context("Could not open session file")?;
+    let reader = BufReader::new(file);
+
+    // ANSI colors: cyan for user, yellow for assistant
+    const CYAN: &str = "\x1b[36m";
+    const YELLOW: &str = "\x1b[33m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut line_count = 0;
+    const MAX_LINES: usize = 100;
+
+    for line in reader.lines() {
+        if line_count >= MAX_LINES {
+            break;
+        }
+
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
+
+        match entry_type {
+            Some("user") => {
+                if let Some(text) = extract_message_text(&entry) {
+                    // Skip system prompts and XML content
+                    if !text.starts_with('[') && !text.starts_with('<') && !text.starts_with('/') {
+                        let first_line = text.lines().next().unwrap_or(&text);
+                        let truncated = truncate_str(first_line, 120);
+                        println!("{}U: {}{}", CYAN, truncated, RESET);
+                        line_count += 1;
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = extract_message_text(&entry) {
+                    let first_line = text.lines().next().unwrap_or(&text);
+                    let truncated = truncate_str(first_line, 80);
+                    println!("{}A: {}{}", YELLOW, truncated, RESET);
+                    line_count += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if line_count == 0 {
+        println!("(empty session)");
+    }
+
+    Ok(())
+}
+
+/// Extract text content from a message entry
+fn extract_message_text(entry: &serde_json::Value) -> Option<String> {
+    let content = entry.get("message")?.get("content")?;
+
+    // Content can be a string or array of content blocks
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+
+    content.as_array()?.iter().find_map(|c| {
+        if c.get("type")?.as_str()? == "text" {
+            Some(c.get("text")?.as_str()?.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Truncate string to max chars, adding ... if truncated
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
+}
+
+// =============================================================================
+// Interactive Mode (skim - no external dependencies)
 // =============================================================================
 
 fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use skim::prelude::*;
+    use std::process::Command;
 
-    // Check for required dependencies
-    let missing: Vec<&str> = ["fzf", "jaq"]
-        .into_iter()
-        .filter(|cmd| {
-            Command::new("which")
-                .arg(cmd)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| !s.success())
-                .unwrap_or(true)
-        })
-        .collect();
-
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "Missing required dependencies: {}\nInstall with: brew install {}",
-            missing.join(", "),
-            missing.join(" ")
-        );
-    }
-
-    // Get path to current executable for search reload
+    // Get path to current executable for preview
     let exe_path = std::env::current_exe().context("Could not get executable path")?;
 
-    let input: String = sessions
-        .iter()
-        .map(|s| format_session_fzf(s))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Write session list to temp file for reload back to normal mode
-    let temp_file = std::env::temp_dir().join(format!("cc-sessions-{}.txt", std::process::id()));
-    fs::write(&temp_file, &input)?;
-
-    // Preview: in search mode show rg matches, otherwise show transcript
-    // Colors: cyan for user (U:), yellow for assistant (A:)
-    let preview_cmd = r#"f=$(echo {} | cut -f1); q="$FZF_QUERY"; [ -f "$f" ] && { if [ -n "$q" ] && [ "$FZF_PROMPT" = "search> " ]; then rg --color=always -C1 "$q" "$f" 2>/dev/null | head -80 || echo "No matches"; else jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "U: " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "A: " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | awk 'BEGIN{u="\033[36m";a="\033[33m";r="\033[0m"} /^U:/{print u $0 r;next} /^A:/{print a $0 r;next} {print}' | grep -v "^. $" | grep -v "\[Request" | head -100; fi; } || echo "No preview""#;
+    // Build preview command that calls ourselves with --preview
+    let preview_cmd = format!("{} --preview {{}}", exe_path.display());
 
     let header = if fork {
-        "FORK │ ctrl-s: search transcripts │ ctrl-n: normal"
+        "FORK mode │ Select session to fork"
     } else {
-        "ctrl-s: search transcripts │ ctrl-n: normal │ CREAT MOD PROJECT"
+        "Select session to resume │ CREAT MOD PROJECT"
     };
 
-    // Keybindings: ctrl-s enables search mode, ctrl-n returns to filter mode
-    let bind_search = format!(
-        "ctrl-s:disable-search+change-prompt(search> )+reload({} --search {{q}})",
-        exe_path.display()
-    );
-    let bind_normal = format!(
-        "ctrl-n:enable-search+change-prompt(filter> )+reload(cat {})+clear-query",
-        temp_file.display()
-    );
-    let bind_change = format!("change:reload:{} --search {{q}}", exe_path.display());
+    let options = SkimOptionsBuilder::default()
+        .height(Some("100%"))
+        .preview(Some(&preview_cmd))
+        .preview_window(Some("right:50%:wrap"))
+        .header(Some(header))
+        .prompt(Some("filter> "))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
 
-    let mut fzf = Command::new("fzf")
-        .args([
-            "--delimiter=\t",
-            "--with-nth=5..",
-            "--preview",
-            preview_cmd,
-            "--preview-window=right:50%:wrap",
-            &format!("--header={}", header),
-            "--prompt=filter> ",
-            "--no-hscroll",
-            "--ansi",
-            "--bind",
-            &bind_search,
-            "--bind",
-            &bind_normal,
-            "--bind",
-            &bind_change,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn fzf - is it installed?")?;
+    // Create items from sessions
+    let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
 
-    if let Some(mut stdin) = fzf.stdin.take() {
-        stdin.write_all(input.as_bytes())?;
+    for session in sessions {
+        let item = SessionItem {
+            filepath: session.filepath.clone(),
+            session_id: session.id.clone(),
+            project_path: session.project_path.clone(),
+            display: format!(
+                "{:<6} {:<6} {:<12} {}",
+                format_time_relative(session.created),
+                format_time_relative(session.modified),
+                session.project,
+                format_session_desc(session, 50),
+            ),
+        };
+        let _ = tx.send(Arc::new(item));
     }
+    drop(tx); // Close sender so skim knows input is complete
 
-    let output = fzf.wait_with_output()?;
+    let output = Skim::run_with(&options, Some(rx));
 
-    // Clean up temp file
-    let _ = fs::remove_file(&temp_file);
+    if let Some(out) = output {
+        if out.is_abort {
+            return Ok(());
+        }
 
-    if output.status.success() {
-        let selected = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = selected.trim().split('\t').collect();
-        if parts.len() >= 3 {
-            let session_id = parts[1];
-            let project_path = parts[2];
+        if let Some(item) = out.selected_items.first() {
+            let session_item = item
+                .as_any()
+                .downcast_ref::<SessionItem>()
+                .context("Failed to get selected session")?;
 
             let action = if fork { "Forking" } else { "Resuming" };
-            println!("{} session {} in {}", action, session_id, project_path);
+            println!(
+                "{} session {} in {}",
+                action, session_item.session_id, session_item.project_path
+            );
 
             // Change to project directory and run claude
             let fork_flag = if fork { " --fork-session" } else { "" };
             let cmd = format!(
                 "cd '{}' && claude -r '{}'{}",
-                project_path, session_id, fork_flag
+                session_item.project_path, session_item.session_id, fork_flag
             );
             Command::new("zsh").args(["-c", &cmd]).status()?;
         }
     }
 
     Ok(())
+}
+
+/// Session item for skim display
+struct SessionItem {
+    filepath: PathBuf,
+    session_id: String,
+    project_path: String,
+    display: String,
+}
+
+impl SkimItem for SessionItem {
+    fn text(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.display)
+    }
+
+    fn preview(&self, _context: PreviewContext) -> ItemPreview {
+        // Return the filepath for the preview command
+        ItemPreview::Text(self.filepath.to_string_lossy().to_string())
+    }
 }
 
 // =============================================================================

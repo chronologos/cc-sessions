@@ -294,6 +294,7 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 ///
 /// Finds sessions containing the pattern and extracts metadata directly
 /// from the matching files (no index dependency).
+#[allow(dead_code)] // Useful for future transcript search feature
 pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
     let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
 
