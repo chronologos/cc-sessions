@@ -296,7 +296,8 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     fs::write(&temp_file, &input)?;
 
     // Preview: in search mode show rg matches, otherwise show transcript
-    let preview_cmd = r#"f=$(echo {} | cut -f1); q="$FZF_QUERY"; [ -f "$f" ] && { if [ -n "$q" ] && [ "$FZF_PROMPT" = "search> " ]; then rg --color=always -C1 "$q" "$f" 2>/dev/null | head -80 || echo "No matches"; else jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "👤 " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "🤖 " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | grep -v "^. $" | grep -v "\[Request" | head -100; fi; } || echo "No preview""#;
+    // Colors: cyan for user (U:), yellow for assistant (A:)
+    let preview_cmd = r#"f=$(echo {} | cut -f1); q="$FZF_QUERY"; [ -f "$f" ] && { if [ -n "$q" ] && [ "$FZF_PROMPT" = "search> " ]; then rg --color=always -C1 "$q" "$f" 2>/dev/null | head -80 || echo "No matches"; else jaq -r 'if .type=="user" then .message.content[]? | select(.type=="text") | "U: " + (.text | split("\n")[0]) elif .type=="assistant" then .message.content[]? | select(.type=="text") | "A: " + (.text | split("\n")[0] | if length > 80 then .[0:80] + "..." else . end) else empty end' "$f" 2>/dev/null | awk 'BEGIN{u="\033[36m";a="\033[33m";r="\033[0m"} /^U:/{print u $0 r;next} /^A:/{print a $0 r;next} {print}' | grep -v "^. $" | grep -v "\[Request" | head -100; fi; } || echo "No preview""#;
 
     let header = if fork {
         "FORK │ ctrl-s: search transcripts │ ctrl-n: normal"

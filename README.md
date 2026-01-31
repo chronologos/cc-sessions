@@ -53,7 +53,7 @@ CREAT  MOD    PROJECT          SUMMARY
 ### Interactive mode (`-i`)
 
 - **Fuzzy search** through project names, summaries, and transcript metadata
-- **Preview pane** shows conversation transcript with 👤 user / 🤖 assistant prefixes
+- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
 - **Hybrid search**: `ctrl-s` for full-text transcript search, `ctrl-n` for normal filter
 - **Enter** to resume session in the original project directory
 - Use `-f` to fork instead of resume (creates new session ID)
