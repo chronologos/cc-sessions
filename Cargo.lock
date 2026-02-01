@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "cc-sessions"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap 4.5.55",

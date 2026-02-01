@@ -41,12 +41,20 @@ jobs:
     strategy:
       matrix:
         include:
+          # macOS
           - target: aarch64-apple-darwin
             os: macos-latest
             name: cc-sessions-macos-arm64
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-13
             name: cc-sessions-macos-x86_64
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: cc-sessions-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: cc-sessions-linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -130,23 +138,33 @@ jobs:
 
             ```bash
             # macOS ARM64 (Apple Silicon)
-            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}/cc-sessions-macos-arm64 -o ~/bin/cc-sessions
+            curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
+            chmod +x ~/.local/bin/cc-sessions
+            xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
 
             # macOS x86_64 (Intel)
-            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ needs.check-version.outputs.version }}/cc-sessions-macos-x86_64 -o ~/bin/cc-sessions
+            curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-macos-x86_64 -o ~/.local/bin/cc-sessions
+            chmod +x ~/.local/bin/cc-sessions
+            xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
 
-            # Then:
-            chmod +x ~/bin/cc-sessions
-            xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
+            # Linux x86_64
+            curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-linux-x86_64 -o ~/.local/bin/cc-sessions
+            chmod +x ~/.local/bin/cc-sessions
+
+            # Linux ARM64
+            curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-linux-arm64 -o ~/.local/bin/cc-sessions
+            chmod +x ~/.local/bin/cc-sessions
             ```
 
             ### Verify checksum
 
             ```bash
-            shasum -a 256 ~/bin/cc-sessions
+            shasum -a 256 ~/.local/bin/cc-sessions
             # Compare with checksums.sha256 below
             ```
           files: |
             release/cc-sessions-macos-arm64
             release/cc-sessions-macos-x86_64
+            release/cc-sessions-linux-x86_64
+            release/cc-sessions-linux-arm64
             release/checksums.sha256

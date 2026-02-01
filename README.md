@@ -6,13 +6,26 @@ A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) session
 
 ## Installation
 
-### Pre-built binary (macOS ARM64)
+### Pre-built binaries
 
 ```bash
-curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-arm64 -o ~/bin/cc-sessions
-chmod +x ~/bin/cc-sessions
-# Ad-hoc sign to avoid Gatekeeper
-xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
+# macOS ARM64 (Apple Silicon)
+curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
+chmod +x ~/.local/bin/cc-sessions
+xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
+
+# macOS x86_64 (Intel)
+curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-x86_64 -o ~/.local/bin/cc-sessions
+chmod +x ~/.local/bin/cc-sessions
+xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
+
+# Linux x86_64
+curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-linux-x86_64 -o ~/.local/bin/cc-sessions
+chmod +x ~/.local/bin/cc-sessions
+
+# Linux ARM64
+curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-linux-arm64 -o ~/.local/bin/cc-sessions
+chmod +x ~/.local/bin/cc-sessions
 ```
 
 ### Build from source
