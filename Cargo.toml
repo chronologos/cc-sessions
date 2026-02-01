@@ -1,5 +1,5 @@
 [package]
-name = "cc-session"
+name = "cc-sessions"
 version = "0.9.0"
 edition = "2024"
 rust-version = "1.85"

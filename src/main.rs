@@ -607,6 +607,7 @@ fn highlight_match(text: &str, pattern: &str) -> String {
 
 fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
     use skim::prelude::*;
+    use std::collections::HashMap;
     use std::process::Command;
 
     let projects_dir = claude_code::get_claude_projects_dir()?;
@@ -638,18 +639,23 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 
         let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
 
+        // Build lookup table: display text -> session data
+        // This is more reliable than downcasting, which can fail with skim's internal wrapping
+        let mut session_lookup: HashMap<String, (&Session, PathBuf)> = HashMap::new();
+
         for session in &current_sessions {
+            let display = format!(
+                "{:<6} {:<6} {:<12} {}",
+                format_time_relative(session.created),
+                format_time_relative(session.modified),
+                session.project,
+                format_session_desc(session, 50),
+            );
+            session_lookup.insert(display.clone(), (session, session.filepath.clone()));
+
             let item = SessionItem {
                 filepath: session.filepath.clone(),
-                session_id: session.id.clone(),
-                project_path: session.project_path.clone(),
-                display: format!(
-                    "{:<6} {:<6} {:<12} {}",
-                    format_time_relative(session.created),
-                    format_time_relative(session.modified),
-                    session.project,
-                    format_session_desc(session, 50),
-                ),
+                display,
                 search_pattern: search_pattern.clone(),
             };
             let _ = tx.send(Arc::new(item));
@@ -699,23 +705,53 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 
                 // Normal selection (Enter)
                 if let Some(item) = out.selected_items.first() {
-                    let session_item = item
-                        .as_any()
-                        .downcast_ref::<SessionItem>()
-                        .context("Failed to get selected session")?;
+                    // Use text() to get display string, then look up in our table
+                    // This is more reliable than downcasting which can fail with skim
+                    let display_text = item.text().to_string();
+                    let (session, filepath) = session_lookup
+                        .get(&display_text)
+                        .context("Session not found in lookup table")?;
 
                     let action = if fork { "Forking" } else { "Resuming" };
                     println!(
                         "{} session {} in {}",
-                        action, session_item.session_id, session_item.project_path
+                        action, session.id, session.project_path
                     );
 
                     let fork_flag = if fork { " --fork-session" } else { "" };
+                    let project_path = &session.project_path;
+
+                    // Validate project path exists before trying to resume
+                    if project_path.is_empty() {
+                        eprintln!(
+                            "Error: Session {} has no project path recorded",
+                            session.id
+                        );
+                        eprintln!("Session file: {}", filepath.display());
+                        return Err(anyhow::anyhow!("Cannot resume: no project path"));
+                    }
+
+                    if !std::path::Path::new(project_path).exists() {
+                        eprintln!("Error: Project directory no longer exists: {}", project_path);
+                        eprintln!("Session file: {}", filepath.display());
+                        return Err(anyhow::anyhow!(
+                            "Cannot resume: directory '{}' not found",
+                            project_path
+                        ));
+                    }
+
                     let cmd = format!(
                         "cd '{}' && claude -r '{}'{}",
-                        session_item.project_path, session_item.session_id, fork_flag
+                        project_path, session.id, fork_flag
                     );
-                    Command::new("zsh").args(["-c", &cmd]).status()?;
+                    let status = Command::new("zsh").args(["-c", &cmd]).status()?;
+
+                    if !status.success() {
+                        let code = status.code().unwrap_or(-1);
+                        eprintln!("Claude exited with code {}", code);
+                        eprintln!("Command was: {}", cmd);
+                        eprintln!("Session file: {}", filepath.display());
+                    }
                     return Ok(());
                 }
             }
@@ -727,8 +763,6 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 /// Session item for skim display
 struct SessionItem {
     filepath: PathBuf,
-    session_id: String,
-    project_path: String,
     display: String,
     search_pattern: Option<String>, // When set, preview shows matching lines
 }

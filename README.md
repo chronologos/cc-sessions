@@ -17,13 +17,10 @@ xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
 
 ### Build from source
 
-Requires Rust 1.85+ (edition 2024).
+Requires Rust 1.85+ (edition 2024) and [just](https://github.com/casey/just).
 
 ```bash
-cargo build --release
-cp target/release/cc-session ~/bin/cc-sessions
-# macOS: ad-hoc sign
-xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions
+just install  # Build and install to ~/.local/bin (includes macOS signing)
 ```
 
 ## Usage

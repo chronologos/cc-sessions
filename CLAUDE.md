@@ -1,22 +1,13 @@
-# cc-session
+# cc-sessions
 
 Agent-focused documentation. See README.md for user-facing docs.
 
 ## Build & Test
 
 ```bash
-cargo build --release
-cargo test
-cp target/release/cc-session ~/bin/cc-sessions
-xattr -cr ~/bin/cc-sessions && codesign -s - ~/bin/cc-sessions  # macOS
-```
-
-Or use the justfile:
-
-```bash
 just build    # Build release binary
 just test     # Run tests
-just install  # Build and install to ~/.local/bin
+just install  # Build and install to ~/.local/bin (includes macOS signing)
 just lint     # Run clippy
 ```
 
@@ -126,7 +117,7 @@ Uses embedded [skim](https://github.com/lotabout/skim) crate (no external fzf de
 
 1. Build `SkimOptions` with preview command pointing to self
 2. Send `SessionItem`s through crossbeam channel
-3. Preview calls `cc-session --preview <filepath>` to format transcript
+3. Preview calls `cc-sessions --preview <filepath>` to format transcript
 4. On selection, spawns `zsh -c "cd <project> && claude -r <session-id>"`
 
 The `--preview` flag is internal: it reads a `.jsonl` file and outputs color-coded transcript lines.

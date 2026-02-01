@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(jaq:*)",
+      "Bash(~/.local/bin/cc-session:*)",
+      "Bash(cargo build:*)",
+      "Bash(target/release/cc-session:*)",
+      "Bash(./target/release/cc-session:*)",
+      "Bash(just install:*)"
+    ]
+  }
+}

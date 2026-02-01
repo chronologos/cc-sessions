@@ -1,4 +1,4 @@
-# cc-session justfile
+# cc-sessions justfile
 
 # Default recipe - show available commands
 default:
@@ -12,11 +12,13 @@ build:
 test:
     cargo test
 
-# Build and install to ~/.local/bin
+# Build and install to ~/.local/bin (with macOS signing)
 install: build
-    cp target/release/cc-session ~/.local/bin/
+    cp target/release/cc-sessions ~/.local/bin/
+    xattr -cr ~/.local/bin/cc-sessions
+    codesign -s - ~/.local/bin/cc-sessions
 
-# Run with arguments (e.g., just run -- -i)
+# Run with arguments (e.g., just run -- --list)
 run *ARGS:
     cargo run --release -- {{ARGS}}
 
