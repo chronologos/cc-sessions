@@ -10,6 +10,7 @@ jobs:
     outputs:
       should_release: ${{ steps.check.outputs.should_release }}
       version: ${{ steps.check.outputs.version }}
+      prev_tag: ${{ steps.check.outputs.prev_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,6 +21,10 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Get previous tag for changelog
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
 
           # Check if tag already exists
           if git rev-parse "v$VERSION" >/dev/null 2>&1; then
@@ -56,7 +61,7 @@ jobs:
 
       - name: Rename binary
         run: |
-          cp target/${{ matrix.target }}/release/cc-session ${{ matrix.name }}
+          cp target/${{ matrix.target }}/release/cc-sessions ${{ matrix.name }}
 
       - name: Generate SHA256
         run: |
@@ -77,11 +82,29 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG="${{ needs.check-version.outputs.prev_tag }}"
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog from $PREV_TAG to HEAD"
+            CHANGELOG=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD)
+          else
+            echo "No previous tag, using all commits"
+            CHANGELOG=$(git log --pretty=format:"- %s")
+          fi
+          # Escape for GitHub Actions
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Prepare release files
         run: |
@@ -98,6 +121,10 @@ jobs:
           name: v${{ needs.check-version.outputs.version }}
           body: |
             ## cc-sessions v${{ needs.check-version.outputs.version }}
+
+            ### Changes
+
+            ${{ steps.changelog.outputs.changelog }}
 
             ### Installation
 
@@ -119,9 +146,6 @@ jobs:
             shasum -a 256 ~/bin/cc-sessions
             # Compare with checksums.sha256 below
             ```
-
-            ### Requirements
-            - `fzf` and `jaq` for interactive mode: `brew install fzf jaq`
           files: |
             release/cc-sessions-macos-arm64
             release/cc-sessions-macos-x86_64
