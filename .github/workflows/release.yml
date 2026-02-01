@@ -41,13 +41,10 @@ jobs:
     strategy:
       matrix:
         include:
-          # macOS
+          # macOS (ARM64 only - Intel Macs can use Rosetta)
           - target: aarch64-apple-darwin
             os: macos-latest
             name: cc-sessions-macos-arm64
-          - target: x86_64-apple-darwin
-            os: macos-13
-            name: cc-sessions-macos-x86_64
           # Linux
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -137,13 +134,8 @@ jobs:
             ### Installation
 
             ```bash
-            # macOS ARM64 (Apple Silicon)
+            # macOS (Apple Silicon, or Intel via Rosetta)
             curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
-            chmod +x ~/.local/bin/cc-sessions
-            xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
-
-            # macOS x86_64 (Intel)
-            curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-macos-x86_64 -o ~/.local/bin/cc-sessions
             chmod +x ~/.local/bin/cc-sessions
             xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
 
@@ -164,7 +156,6 @@ jobs:
             ```
           files: |
             release/cc-sessions-macos-arm64
-            release/cc-sessions-macos-x86_64
             release/cc-sessions-linux-x86_64
             release/cc-sessions-linux-arm64
             release/checksums.sha256

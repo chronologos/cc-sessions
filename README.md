@@ -9,13 +9,8 @@ A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) session
 ### Pre-built binaries
 
 ```bash
-# macOS ARM64 (Apple Silicon)
+# macOS (Apple Silicon, or Intel via Rosetta)
 curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
-chmod +x ~/.local/bin/cc-sessions
-xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
-
-# macOS x86_64 (Intel)
-curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-x86_64 -o ~/.local/bin/cc-sessions
 chmod +x ~/.local/bin/cc-sessions
 xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
 
