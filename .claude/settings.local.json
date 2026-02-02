@@ -8,5 +8,10 @@
       "Bash(./target/release/cc-session:*)",
       "Bash(just install:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "anki",
+    "qmd"
+  ],
+  "enableAllProjectMcpServers": true
 }

@@ -128,6 +128,9 @@ fn extract_session_metadata(filepath: &Path, parent_dir_name: &str) -> Option<Se
     // Extract metadata from file tail (summary, customTitle)
     let (summary, custom_title) = read_file_tail(filepath);
 
+    // Count conversation turns (user messages)
+    let turn_count = count_turns(filepath);
+
     // Skip "empty" sessions that have no user content
     if project_path.is_empty() && first_message.is_none() && summary.is_none() {
         return None;
@@ -145,6 +148,7 @@ fn extract_session_metadata(filepath: &Path, parent_dir_name: &str) -> Option<Se
         first_message,
         summary,
         name: custom_title,
+        turn_count,
     })
 }
 
@@ -207,6 +211,27 @@ fn read_file_tail(filepath: &Path) -> (Option<String>, Option<String>) {
     let summary = read_summary_from_tail(filepath);
     let custom_title = find_custom_title(filepath);
     (summary, custom_title)
+}
+
+/// Count conversation turns (user messages) in a session file.
+///
+/// Uses grep for efficiency - counts lines matching `"type":"user"`.
+fn count_turns(filepath: &Path) -> usize {
+    let matcher = match RegexMatcher::new_line_matcher(r#""type"\s*:\s*"user""#) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+
+    let mut count = 0;
+    let _ = Searcher::new().search_path(
+        &matcher,
+        filepath,
+        UTF8(|_, _| {
+            count += 1;
+            Ok(true) // Continue to count all matches
+        }),
+    );
+    count
 }
 
 /// Read summary from the tail of the file (last 16KB)
@@ -306,7 +331,7 @@ pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Sess
         .filter_map(|e| e.ok())
         .filter(|e| {
             let path = e.path();
-            if !path.extension().is_some_and(|ext| ext == "jsonl") {
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
                 return false;
             }
             if path.to_string_lossy().contains("/subagents/") {

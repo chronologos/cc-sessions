@@ -30,6 +30,10 @@ struct Args {
     #[arg(long)]
     project: Option<String>,
 
+    /// Minimum number of conversation turns (filters out one-shot sessions)
+    #[arg(long)]
+    min_turns: Option<usize>,
+
     /// Preview a session file (internal use by interactive mode)
     #[arg(long, value_name = "FILE")]
     preview: Option<PathBuf>,
@@ -54,6 +58,7 @@ pub struct Session {
     pub first_message: Option<String>,
     pub summary: Option<String>,
     pub name: Option<String>, // customTitle from /rename - indicates important session
+    pub turn_count: usize,    // Number of user messages (conversation turns)
 }
 
 // =============================================================================
@@ -83,6 +88,11 @@ fn main() -> Result<()> {
         sessions.retain(|s| s.project.to_lowercase().contains(&filter_lower));
     }
 
+    // Filter by minimum turns (excludes one-shot sessions)
+    if let Some(min) = args.min_turns {
+        sessions.retain(|s| s.turn_count >= min);
+    }
+
     if sessions.is_empty() {
         if args.project.is_some() {
             anyhow::bail!("No sessions found matching project filter");
@@ -106,8 +116,8 @@ fn main() -> Result<()> {
 fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
     if debug {
         println!(
-            "{:<6} {:<6} {:<16} {:<40} {}",
-            "CREAT", "MOD", "PROJECT", "ID", "SUMMARY"
+            "{:<6} {:<6} {:<16} {:<40} SUMMARY",
+            "CREAT", "MOD", "PROJECT", "ID"
         );
         println!("{}", "─".repeat(110));
 
@@ -130,10 +140,7 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
         println!("{}", "─".repeat(110));
         println!("Total: {} sessions", sessions.len());
     } else {
-        println!(
-            "{:<6} {:<6} {:<16} {}",
-            "CREAT", "MOD", "PROJECT", "SUMMARY"
-        );
+        println!("{:<6} {:<6} {:<16} SUMMARY", "CREAT", "MOD", "PROJECT");
         println!("{}", "─".repeat(90));
 
         for session in sessions.iter().take(count) {
@@ -482,7 +489,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         if match_idx > 0 && !shown_indices.contains(&(match_idx - 1)) {
             let prev = &messages[match_idx - 1];
             output.push_str(&format_context_message(prev, DIM, RESET));
-            output.push_str("\n");
+            output.push('\n');
             shown_indices.insert(match_idx - 1);
         }
 
@@ -494,7 +501,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
         // Show next message (context)
         if match_idx + 1 < messages.len() && !shown_indices.contains(&(match_idx + 1)) {
-            output.push_str("\n");
+            output.push('\n');
             let next = &messages[match_idx + 1];
             output.push_str(&format_context_message(next, DIM, RESET));
             shown_indices.insert(match_idx + 1);
@@ -723,16 +730,16 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 
                     // Validate project path exists before trying to resume
                     if project_path.is_empty() {
-                        eprintln!(
-                            "Error: Session {} has no project path recorded",
-                            session.id
-                        );
+                        eprintln!("Error: Session {} has no project path recorded", session.id);
                         eprintln!("Session file: {}", filepath.display());
                         return Err(anyhow::anyhow!("Cannot resume: no project path"));
                     }
 
                     if !std::path::Path::new(project_path).exists() {
-                        eprintln!("Error: Project directory no longer exists: {}", project_path);
+                        eprintln!(
+                            "Error: Project directory no longer exists: {}",
+                            project_path
+                        );
                         eprintln!("Session file: {}", filepath.display());
                         return Err(anyhow::anyhow!(
                             "Cannot resume: directory '{}' not found",
@@ -799,7 +806,7 @@ mod tests {
 
     #[test]
     fn project_filter_case_insensitive() {
-        let projects = vec![
+        let projects = [
             "holy-grail",
             "Ministry-Of-Silly-Walks",
             "SPANISH-INQUISITION",
@@ -814,14 +821,14 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(matches("spanish"), vec!["SPANISH-INQUISITION"]);
-        assert_eq!(matches("SILLY"), vec!["Ministry-Of-Silly-Walks"]);
-        assert_eq!(matches("grail"), vec!["holy-grail"]);
+        assert_eq!(matches("spanish"), ["SPANISH-INQUISITION"]);
+        assert_eq!(matches("SILLY"), ["Ministry-Of-Silly-Walks"]);
+        assert_eq!(matches("grail"), ["holy-grail"]);
     }
 
     #[test]
     fn project_filter_substring() {
-        let projects = vec!["spam", "spam-eggs", "spam-eggs-spam"];
+        let projects = ["spam", "spam-eggs", "spam-eggs-spam"];
 
         let matches = |filter: &str| -> Vec<&str> {
             let filter_lower = filter.to_lowercase();
@@ -832,8 +839,8 @@ mod tests {
                 .collect()
         };
 
-        assert_eq!(matches("spam"), vec!["spam", "spam-eggs", "spam-eggs-spam"]);
-        assert_eq!(matches("eggs"), vec!["spam-eggs", "spam-eggs-spam"]);
+        assert_eq!(matches("spam"), ["spam", "spam-eggs", "spam-eggs-spam"]);
+        assert_eq!(matches("eggs"), ["spam-eggs", "spam-eggs-spam"]);
     }
 
     // =========================================================================
