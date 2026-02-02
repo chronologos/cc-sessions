@@ -12,13 +12,9 @@ build:
 test:
     cargo test
 
-# Build and install to ~/.local/bin (with macOS signing if applicable)
+# Build and install to ~/.local/bin
 install: build
     cp target/release/cc-sessions ~/.local/bin/
-    @if [ "$(uname)" = "Darwin" ]; then \
-        xattr -cr ~/.local/bin/cc-sessions && \
-        codesign -s - ~/.local/bin/cc-sessions; \
-    fi
 
 # Run with arguments (e.g., just run -- --list)
 run *ARGS:

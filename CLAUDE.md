@@ -7,7 +7,7 @@ Agent-focused documentation. See README.md for user-facing docs.
 ```bash
 just build    # Build release binary
 just test     # Run tests
-just install  # Build and install to ~/.local/bin (includes macOS signing)
+just install  # Build and install to ~/.local/bin
 just lint     # Run clippy
 ```
 

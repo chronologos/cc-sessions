@@ -12,7 +12,7 @@ A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) session
 # macOS (Apple Silicon, or Intel via Rosetta)
 curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
 chmod +x ~/.local/bin/cc-sessions
-xattr -cr ~/.local/bin/cc-sessions && codesign -s - ~/.local/bin/cc-sessions
+xattr -cr ~/.local/bin/cc-sessions  # Remove quarantine
 
 # Linux x86_64
 curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-linux-x86_64 -o ~/.local/bin/cc-sessions
@@ -28,7 +28,7 @@ chmod +x ~/.local/bin/cc-sessions
 Requires Rust 1.85+ (edition 2024) and [just](https://github.com/casey/just).
 
 ```bash
-just install  # Build and install to ~/.local/bin (includes macOS signing)
+just install  # Build and install to ~/.local/bin
 ```
 
 ## Usage
