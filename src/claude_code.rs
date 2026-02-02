@@ -40,6 +40,15 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+/// Check if a source should be included based on the filter.
+fn should_include_source(remote_filter: Option<&str>, source_name: &str) -> bool {
+    match remote_filter {
+        None => true, // No filter = include everything
+        Some("local") => source_name == "local",
+        Some(filter) => source_name == filter || source_name == "local" && filter == "local",
+    }
+}
+
 /// Find all sessions from local and cached remotes.
 ///
 /// Combines:
@@ -55,38 +64,28 @@ pub fn find_all_sessions(
 
     let mut all_sessions = Vec::new();
 
-    // Load local sessions (unless filtering to a specific remote)
-    let include_local = remote_filter.is_none() || remote_filter == Some("local");
-    if include_local {
+    // Load local sessions
+    if should_include_source(remote_filter, "local") {
         let local_dir = get_claude_projects_dir()?;
         if local_dir.exists() {
-            let local = find_sessions(&local_dir)?;
-            all_sessions.extend(local);
+            all_sessions.extend(find_sessions(&local_dir)?);
         }
     }
 
     // Load cached remote sessions
     for (name, remote_config) in &config.remotes {
-        // Skip if filtering to a different remote
-        if let Some(filter) = remote_filter {
-            if filter != "local" && filter != name {
-                continue;
-            }
+        if !should_include_source(remote_filter, name) {
+            continue;
         }
-
-        // Skip local filter when processing remotes
+        // "local" filter should not include remotes
         if remote_filter == Some("local") {
             continue;
         }
 
         let cache_dir = match remote::get_remote_cache_dir(&config.settings, name) {
-            Ok(dir) => dir,
-            Err(_) => continue,
+            Ok(dir) if dir.exists() => dir,
+            _ => continue,
         };
-
-        if !cache_dir.exists() {
-            continue; // Not synced yet
-        }
 
         let source = SessionSource::Remote {
             name: name.clone(),
@@ -95,14 +94,11 @@ pub fn find_all_sessions(
         };
 
         match find_sessions_with_source(&cache_dir, source) {
-            Ok(remote_sessions) => all_sessions.extend(remote_sessions),
-            Err(e) => {
-                eprintln!("Warning: Failed to load sessions from '{}': {}", name, e);
-            }
+            Ok(sessions) => all_sessions.extend(sessions),
+            Err(e) => eprintln!("Warning: Failed to load sessions from '{}': {}", name, e),
         }
     }
 
-    // Sort all sessions by modified time (most recent first)
     all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(all_sessions)
 }
@@ -117,38 +113,28 @@ pub fn search_all_sessions(
 
     let mut all_sessions = Vec::new();
 
-    // Search local sessions (unless filtering to a specific remote)
-    let include_local = remote_filter.is_none() || remote_filter == Some("local");
-    if include_local {
+    // Search local sessions
+    if should_include_source(remote_filter, "local") {
         let local_dir = get_claude_projects_dir()?;
         if local_dir.exists() {
-            let local = search_sessions(&local_dir, pattern)?;
-            all_sessions.extend(local);
+            all_sessions.extend(search_sessions(&local_dir, pattern)?);
         }
     }
 
     // Search cached remote sessions
     for (name, remote_config) in &config.remotes {
-        // Skip if filtering to a different remote
-        if let Some(filter) = remote_filter {
-            if filter != "local" && filter != name {
-                continue;
-            }
+        if !should_include_source(remote_filter, name) {
+            continue;
         }
-
-        // Skip local filter when processing remotes
+        // "local" filter should not include remotes
         if remote_filter == Some("local") {
             continue;
         }
 
         let cache_dir = match remote::get_remote_cache_dir(&config.settings, name) {
-            Ok(dir) => dir,
-            Err(_) => continue,
+            Ok(dir) if dir.exists() => dir,
+            _ => continue,
         };
-
-        if !cache_dir.exists() {
-            continue;
-        }
 
         let source = SessionSource::Remote {
             name: name.clone(),
@@ -157,17 +143,11 @@ pub fn search_all_sessions(
         };
 
         match search_sessions_with_source(&cache_dir, pattern, source) {
-            Ok(remote_sessions) => all_sessions.extend(remote_sessions),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to search sessions from '{}': {}",
-                    name, e
-                );
-            }
+            Ok(sessions) => all_sessions.extend(sessions),
+            Err(e) => eprintln!("Warning: Failed to search sessions from '{}': {}", name, e),
         }
     }
 
-    // Sort all sessions by modified time (most recent first)
     all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(all_sessions)
 }
@@ -197,22 +177,7 @@ pub fn find_sessions_with_source(
         .max_depth(2)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            let path = e.path();
-            // Must be .jsonl file
-            if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
-                return false;
-            }
-            // Skip subagents directory
-            if path.to_string_lossy().contains("/subagents/") {
-                return false;
-            }
-            // Must have valid UUID filename
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(is_valid_session_uuid)
-                .unwrap_or(false)
-        })
+        .filter(|e| is_valid_session_file(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect();
 
@@ -235,19 +200,32 @@ pub fn find_sessions_with_source(
 
 /// Check if a string is a valid UUID (8-4-4-4-12 format with hex chars)
 fn is_valid_session_uuid(s: &str) -> bool {
+    const SEGMENT_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip(SEGMENT_LENGTHS)
+            .all(|(part, len)| part.len() == len)
+        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Check if a path is a valid session file (UUID.jsonl, not in subagents/)
+fn is_valid_session_file(path: &Path) -> bool {
+    // Must be .jsonl file
+    if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
         return false;
     }
-    if parts[0].len() != 8
-        || parts[1].len() != 4
-        || parts[2].len() != 4
-        || parts[3].len() != 4
-        || parts[4].len() != 12
-    {
+    // Skip subagents directory
+    if path.to_string_lossy().contains("/subagents/") {
         return false;
     }
-    s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    // Must have valid UUID filename
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(is_valid_session_uuid)
+        .unwrap_or(false)
 }
 
 /// Extract all session metadata from a .jsonl file.
@@ -485,20 +463,7 @@ pub fn search_sessions_with_source(
     let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            let path = e.path();
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                return false;
-            }
-            if path.to_string_lossy().contains("/subagents/") {
-                return false;
-            }
-            // Must have valid UUID filename
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(is_valid_session_uuid)
-                .unwrap_or(false)
-        })
+        .filter(|e| is_valid_session_file(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect();
 

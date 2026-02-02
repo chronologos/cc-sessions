@@ -272,29 +272,34 @@ fn format_time_relative(time: SystemTime) -> String {
 
 /// Format session description: show name (★) if present, otherwise summary/first_message
 fn format_session_desc(session: &Session, max_chars: usize) -> String {
+    // Named sessions show ★ prefix with name, then summary if space allows
     if let Some(ref name) = session.name {
-        // Named sessions show ★ prefix with name, then summary if space allows
         let prefix = format!("★ {}", name);
-        if prefix.chars().count() >= max_chars {
+        let prefix_len = prefix.chars().count();
+
+        if prefix_len >= max_chars {
             return prefix.chars().take(max_chars).collect();
         }
-        if let Some(ref summary) = session.summary {
-            let remaining = max_chars - prefix.chars().count() - 3; // " - " separator
-            if remaining > 10 {
-                let summary_truncated: String = summary.chars().take(remaining).collect();
-                return format!("{} - {}", prefix, summary_truncated);
-            }
-        }
-        return prefix;
-    }
 
-    // No name - use summary or first_message
-    session
-        .summary
-        .as_deref()
-        .or(session.first_message.as_deref())
-        .map(|s| s.chars().take(max_chars).collect())
-        .unwrap_or_default()
+        // Append summary if there's enough room
+        match &session.summary {
+            Some(summary) if max_chars > prefix_len + 13 => {
+                // " - " + at least 10 chars
+                let remaining = max_chars - prefix_len - 3;
+                let summary_truncated: String = summary.chars().take(remaining).collect();
+                format!("{} - {}", prefix, summary_truncated)
+            }
+            _ => prefix,
+        }
+    } else {
+        // No name - use summary or first_message
+        session
+            .summary
+            .as_deref()
+            .or(session.first_message.as_deref())
+            .map(|s| s.chars().take(max_chars).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
@@ -325,71 +330,28 @@ pub fn normalize_summary(text: &str, max_chars: usize) -> String {
 }
 
 // =============================================================================
+// ANSI Colors (shared across preview functions)
+// =============================================================================
+
+mod colors {
+    pub const CYAN: &str = "\x1b[36m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const BOLD_INVERSE: &str = "\x1b[1;7m";
+    pub const RESET: &str = "\x1b[0m";
+}
+
+// =============================================================================
 // Preview Mode (internal, replaces jaq dependency)
 // =============================================================================
 
 /// Print formatted transcript preview for a session file.
 /// Used internally by skim's preview command.
 fn print_session_preview(filepath: &PathBuf) -> Result<()> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = File::open(filepath).context("Could not open session file")?;
-    let reader = BufReader::new(file);
-
-    // ANSI colors: cyan for user, yellow for assistant
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const RESET: &str = "\x1b[0m";
-
-    let mut line_count = 0;
-    const MAX_LINES: usize = 100;
-
-    for line in reader.lines() {
-        if line_count >= MAX_LINES {
-            break;
-        }
-
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-
-        match entry_type {
-            Some("user") => {
-                if let Some(text) = extract_message_text(&entry) {
-                    // Skip system prompts and XML content
-                    if !text.starts_with('[') && !text.starts_with('<') && !text.starts_with('/') {
-                        let first_line = text.lines().next().unwrap_or(&text);
-                        let truncated = truncate_str(first_line, 120);
-                        println!("{}U: {}{}", CYAN, truncated, RESET);
-                        line_count += 1;
-                    }
-                }
-            }
-            Some("assistant") => {
-                if let Some(text) = extract_message_text(&entry) {
-                    let first_line = text.lines().next().unwrap_or(&text);
-                    let truncated = truncate_str(first_line, 80);
-                    println!("{}A: {}{}", YELLOW, truncated, RESET);
-                    line_count += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if line_count == 0 {
-        println!("(empty session)");
-    }
-
+    let content = generate_preview_content(filepath)?;
+    print!("{}", content);
     Ok(())
 }
 
@@ -428,23 +390,14 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
     let file = File::open(filepath).context("Could not open session file")?;
     let reader = BufReader::new(file);
 
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const RESET: &str = "\x1b[0m";
-
     let mut output = String::new();
     let mut line_count = 0;
     const MAX_LINES: usize = 100;
 
-    for line in reader.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         if line_count >= MAX_LINES {
             break;
         }
-
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
 
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -456,10 +409,13 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
         match entry_type {
             Some("user") => {
                 if let Some(text) = extract_message_text(&entry) {
-                    if !text.starts_with('[') && !text.starts_with('<') && !text.starts_with('/') {
+                    if !is_system_content(&text) {
                         let first_line = text.lines().next().unwrap_or(&text);
                         let truncated = truncate_str(first_line, 120);
-                        output.push_str(&format!("{}U: {}{}\n", CYAN, truncated, RESET));
+                        output.push_str(&format!(
+                            "{}U: {}{}\n",
+                            colors::CYAN, truncated, colors::RESET
+                        ));
                         line_count += 1;
                     }
                 }
@@ -468,7 +424,10 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
                 if let Some(text) = extract_message_text(&entry) {
                     let first_line = text.lines().next().unwrap_or(&text);
                     let truncated = truncate_str(first_line, 80);
-                    output.push_str(&format!("{}A: {}{}\n", YELLOW, truncated, RESET));
+                    output.push_str(&format!(
+                        "{}A: {}{}\n",
+                        colors::YELLOW, truncated, colors::RESET
+                    ));
                     line_count += 1;
                 }
             }
@@ -481,6 +440,11 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
     }
 
     Ok(output)
+}
+
+/// Check if content is system/XML content that should be skipped in previews
+fn is_system_content(text: &str) -> bool {
+    text.starts_with('[') || text.starts_with('<') || text.starts_with('/')
 }
 
 /// A message from the transcript
@@ -499,12 +463,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
     // Collect all messages first
     let mut messages: Vec<Message> = Vec::new();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
+    for line in reader.lines().map_while(Result::ok) {
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -519,9 +478,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
         if let Some(text) = extract_message_text(&entry) {
             // Skip system prompts and XML content for user messages
-            if role == "user"
-                && (text.starts_with('[') || text.starts_with('<') || text.starts_with('/'))
-            {
+            if role == "user" && is_system_content(&text) {
                 continue;
             }
             messages.push(Message {
@@ -531,13 +488,6 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         }
     }
 
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const GREEN: &str = "\x1b[32m";
-    const DIM: &str = "\x1b[2m";
-    const BOLD: &str = "\x1b[1m";
-    const RESET: &str = "\x1b[0m";
-
     let pattern_lower = pattern.to_lowercase();
     let mut output = String::new();
     let mut match_count = 0;
@@ -545,7 +495,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
     output.push_str(&format!(
         "{}Searching for: \"{}\"{}\n\n",
-        GREEN, pattern, RESET
+        colors::GREEN, pattern, colors::RESET
     ));
 
     // Find messages containing the pattern
@@ -561,7 +511,10 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
     for &match_idx in &matching_indices {
         if match_count >= MAX_MATCHES {
-            output.push_str(&format!("\n{}... more matches truncated{}\n", BOLD, RESET));
+            output.push_str(&format!(
+                "\n{}... more matches truncated{}\n",
+                colors::BOLD, colors::RESET
+            ));
             break;
         }
 
@@ -574,21 +527,21 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         if match_count > 0 {
             output.push_str(&format!(
                 "\n{}════════════════════════════════{}\n\n",
-                DIM, RESET
+                colors::DIM, colors::RESET
             ));
         }
 
         // Show previous message (context)
         if match_idx > 0 && !shown_indices.contains(&(match_idx - 1)) {
             let prev = &messages[match_idx - 1];
-            output.push_str(&format_context_message(prev, DIM, RESET));
+            output.push_str(&format_context_message(prev));
             output.push('\n');
             shown_indices.insert(match_idx - 1);
         }
 
         // Show matching message (highlighted)
         let msg = &messages[match_idx];
-        output.push_str(&format_matching_message(msg, pattern, CYAN, YELLOW, RESET));
+        output.push_str(&format_matching_message(msg, pattern));
         shown_indices.insert(match_idx);
         match_count += 1;
 
@@ -596,7 +549,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         if match_idx + 1 < messages.len() && !shown_indices.contains(&(match_idx + 1)) {
             output.push('\n');
             let next = &messages[match_idx + 1];
-            output.push_str(&format_context_message(next, DIM, RESET));
+            output.push_str(&format_context_message(next));
             shown_indices.insert(match_idx + 1);
         }
     }
@@ -606,7 +559,7 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
     } else {
         output.push_str(&format!(
             "\n\n{}{} matching messages{}",
-            BOLD, match_count, RESET
+            colors::BOLD, match_count, colors::RESET
         ));
     }
 
@@ -614,72 +567,67 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 }
 
 /// Format a context message (dimmed, truncated if too long)
-fn format_context_message(msg: &Message, dim: &str, reset: &str) -> String {
+fn format_context_message(msg: &Message) -> String {
     let prefix = if msg.role == "user" { "U" } else { "A" };
-    let max_lines = 10;
+    const MAX_CONTEXT_LINES: usize = 10;
     let lines: Vec<&str> = msg.text.lines().collect();
 
     let mut output = String::new();
-    for (i, line) in lines.iter().take(max_lines).enumerate() {
-        if i == 0 {
-            output.push_str(&format!("{}{}: {}{}\n", dim, prefix, line, reset));
+    for (i, line) in lines.iter().take(MAX_CONTEXT_LINES).enumerate() {
+        let leader = if i == 0 {
+            format!("{}: ", prefix)
         } else {
-            output.push_str(&format!("{}   {}{}\n", dim, line, reset));
-        }
+            "   ".to_string()
+        };
+        output.push_str(&format!(
+            "{}{}{}{}\n",
+            colors::DIM, leader, line, colors::RESET
+        ));
     }
-    if lines.len() > max_lines {
+    if lines.len() > MAX_CONTEXT_LINES {
         output.push_str(&format!(
             "{}   ... ({} more lines){}\n",
-            dim,
-            lines.len() - max_lines,
-            reset
+            colors::DIM,
+            lines.len() - MAX_CONTEXT_LINES,
+            colors::RESET
         ));
     }
     output
 }
 
 /// Format a matching message (colored, with highlights)
-fn format_matching_message(
-    msg: &Message,
-    pattern: &str,
-    cyan: &str,
-    yellow: &str,
-    reset: &str,
-) -> String {
+fn format_matching_message(msg: &Message, pattern: &str) -> String {
     let (prefix, color) = if msg.role == "user" {
-        ("U", cyan)
+        ("U", colors::CYAN)
     } else {
-        ("A", yellow)
+        ("A", colors::YELLOW)
     };
 
+    let pattern_lower = pattern.to_lowercase();
     let mut output = String::new();
-    for (i, line) in msg.text.lines().enumerate() {
-        let line_lower = line.to_lowercase();
-        let pattern_lower = pattern.to_lowercase();
 
-        let formatted_line = if line_lower.contains(&pattern_lower) {
+    for (i, line) in msg.text.lines().enumerate() {
+        let formatted_line = if line.to_lowercase().contains(&pattern_lower) {
             highlight_match(line, pattern)
         } else {
             line.to_string()
         };
 
-        if i == 0 {
-            output.push_str(&format!(
-                "{}{}: {}{}\n",
-                color, prefix, formatted_line, reset
-            ));
+        let leader = if i == 0 {
+            format!("{}: ", prefix)
         } else {
-            output.push_str(&format!("{}   {}{}\n", color, formatted_line, reset));
-        }
+            "   ".to_string()
+        };
+        output.push_str(&format!(
+            "{}{}{}{}\n",
+            color, leader, formatted_line, colors::RESET
+        ));
     }
     output
 }
 
 /// Highlight matching text with bold/inverse
 fn highlight_match(text: &str, pattern: &str) -> String {
-    const BOLD: &str = "\x1b[1;7m"; // Bold + inverse
-    const RESET: &str = "\x1b[0m";
-
     let text_lower = text.to_lowercase();
     let pattern_lower = pattern.to_lowercase();
 
@@ -690,9 +638,9 @@ fn highlight_match(text: &str, pattern: &str) -> String {
         // Add text before match
         result.push_str(&text[last_end..start]);
         // Add highlighted match (using original case from text)
-        result.push_str(BOLD);
+        result.push_str(colors::BOLD_INVERSE);
         result.push_str(&text[start..start + pattern.len()]);
-        result.push_str(RESET);
+        result.push_str(colors::RESET);
         last_end = start + pattern.len();
     }
 
@@ -717,22 +665,25 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
     if project_path.is_empty() {
         eprintln!("Error: Session {} has no project path recorded", session.id);
         eprintln!("Session file: {}", filepath.display());
-        return Err(anyhow::anyhow!("Cannot resume: no project path"));
+        anyhow::bail!("Cannot resume: no project path");
     }
 
-    match &session.source {
+    // Build the claude command (same for local and remote)
+    let claude_cmd = format!(
+        "cd '{}' && claude -r '{}'{}",
+        project_path, session.id, fork_flag
+    );
+
+    let status = match &session.source {
         SessionSource::Local => {
-            // Local session - verify directory exists
+            // Verify directory exists locally
             if !std::path::Path::new(project_path).exists() {
                 eprintln!(
                     "Error: Project directory no longer exists: {}",
                     project_path
                 );
                 eprintln!("Session file: {}", filepath.display());
-                return Err(anyhow::anyhow!(
-                    "Cannot resume: directory '{}' not found",
-                    project_path
-                ));
+                anyhow::bail!("Cannot resume: directory '{}' not found", project_path);
             }
 
             println!(
@@ -740,21 +691,9 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 action, session.id, session.project_path
             );
 
-            let cmd = format!(
-                "cd '{}' && claude -r '{}'{}",
-                project_path, session.id, fork_flag
-            );
-            let status = Command::new("zsh").args(["-c", &cmd]).status()?;
-
-            if !status.success() {
-                let code = status.code().unwrap_or(-1);
-                eprintln!("Claude exited with code {}", code);
-                eprintln!("Command was: {}", cmd);
-                eprintln!("Session file: {}", filepath.display());
-            }
+            Command::new("zsh").args(["-c", &claude_cmd]).status()?
         }
         SessionSource::Remote { name, host, user } => {
-            // Remote session - SSH to the remote and resume there
             let ssh_target = match user {
                 Some(u) => format!("{}@{}", u, host),
                 None => host.clone(),
@@ -765,26 +704,17 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 action, session.id, name, session.project_path
             );
 
-            // Build the remote command
             // -t allocates a pseudo-TTY (required for claude's interactive mode)
-            let remote_cmd = format!(
-                "cd '{}' && claude -r '{}'{}",
-                project_path, session.id, fork_flag
-            );
-
-            let status = Command::new("ssh")
-                .args(["-t", &ssh_target, &remote_cmd])
-                .status()?;
-
-            if !status.success() {
-                let code = status.code().unwrap_or(-1);
-                eprintln!("SSH exited with code {}", code);
-                eprintln!(
-                    "Command was: ssh -t {} \"{}\"",
-                    ssh_target, remote_cmd
-                );
-            }
+            Command::new("ssh")
+                .args(["-t", &ssh_target, &claude_cmd])
+                .status()?
         }
+    };
+
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        eprintln!("Command exited with code {}", code);
+        eprintln!("Session file: {}", filepath.display());
     }
 
     Ok(())

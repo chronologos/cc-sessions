@@ -277,40 +277,35 @@ fn update_last_sync(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sync remotes if they are stale
-///
-/// Returns the list of remotes that were synced
-pub fn sync_if_stale(config: &Config) -> Result<Vec<SyncResult>> {
+/// Sync remotes, optionally checking staleness first.
+fn sync_remotes(config: &Config, check_staleness: bool) -> Result<Vec<SyncResult>> {
     let mut results = Vec::new();
 
     for (name, remote) in &config.remotes {
-        if is_stale(name, &config.settings)? {
-            match sync_remote(name, remote, &config.settings) {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    eprintln!("Warning: Failed to sync '{}': {}", name, e);
-                }
-            }
+        // Skip non-stale remotes if checking staleness
+        if check_staleness && !is_stale(name, &config.settings)? {
+            continue;
+        }
+
+        match sync_remote(name, remote, &config.settings) {
+            Ok(result) => results.push(result),
+            Err(e) => eprintln!("Warning: Failed to sync '{}': {}", name, e),
         }
     }
 
     Ok(results)
 }
 
+/// Sync remotes if they are stale
+///
+/// Returns the list of remotes that were synced
+pub fn sync_if_stale(config: &Config) -> Result<Vec<SyncResult>> {
+    sync_remotes(config, true)
+}
+
 /// Sync all configured remotes regardless of staleness
 pub fn sync_all(config: &Config) -> Result<Vec<SyncResult>> {
-    let mut results = Vec::new();
-
-    for (name, remote) in &config.remotes {
-        match sync_remote(name, remote, &config.settings) {
-            Ok(result) => results.push(result),
-            Err(e) => {
-                eprintln!("Warning: Failed to sync '{}': {}", name, e);
-            }
-        }
-    }
-
-    Ok(results)
+    sync_remotes(config, false)
 }
 
 // =============================================================================
