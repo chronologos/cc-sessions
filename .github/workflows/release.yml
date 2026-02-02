@@ -68,6 +68,11 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/cc-sessions ${{ matrix.name }}
 
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign -s - -f ${{ matrix.name }}
+
       - name: Generate SHA256
         run: |
           shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
@@ -137,7 +142,7 @@ jobs:
             # macOS (Apple Silicon, or Intel via Rosetta)
             curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
             chmod +x ~/.local/bin/cc-sessions
-            xattr -cr ~/.local/bin/cc-sessions  # Remove quarantine
+            xattr -cr ~/.local/bin/cc-sessions && codesign -s - -f ~/.local/bin/cc-sessions
 
             # Linux x86_64
             curl -L https://github.com/${{ github.repository }}/releases/latest/download/cc-sessions-linux-x86_64 -o ~/.local/bin/cc-sessions

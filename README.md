@@ -1,6 +1,12 @@
 # cc-sessions
 
-A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) sessions across all projects.
+Claude Code's `/resume` only shows sessions for your current project, on your current machine. If you work across multiple codebases, finding that session from 3 days ago means remembering which repo you were in.
+
+**cc-sessions fixes this:**
+
+- **Search across machines and projects** — Find any session from anywhere, not just your current directory or machine
+- **Preview before resuming** — See the conversation transcript to jog your memory before jumping in
+- **Full-text search** — Press `ctrl+s` to grep conversation content ("where did I discuss that API?")
 
 ![Interactive mode with transcript preview](preview.png)
 
@@ -12,7 +18,7 @@ A fast CLI tool to list and resume [Claude Code](https://claude.ai/code) session
 # macOS (Apple Silicon, or Intel via Rosetta)
 curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-macos-arm64 -o ~/.local/bin/cc-sessions
 chmod +x ~/.local/bin/cc-sessions
-xattr -cr ~/.local/bin/cc-sessions  # Remove quarantine
+xattr -cr ~/.local/bin/cc-sessions && codesign -s - -f ~/.local/bin/cc-sessions
 
 # Linux x86_64
 curl -L https://github.com/chronologos/cc-sessions/releases/latest/download/cc-sessions-linux-x86_64 -o ~/.local/bin/cc-sessions
@@ -28,7 +34,7 @@ chmod +x ~/.local/bin/cc-sessions
 Requires Rust 1.85+ (edition 2024) and [just](https://github.com/casey/just).
 
 ```bash
-just install  # Build and install to ~/.local/bin
+just install  # Build and install to ~/.local/bin (macOS signing handled automatically)
 ```
 
 ## Usage
@@ -65,13 +71,6 @@ CREAT  MOD    PROJECT          SUMMARY
 
 Sessions renamed with `/rename` in Claude Code show a `★` prefix.
 
-## Features
-
-- **Zero runtime dependencies**: Interactive mode uses embedded [skim](https://github.com/lotabout/skim) (no fzf/jaq needed)
-- **Session names**: Shows `★ name` for sessions renamed with `/rename`
-- **Direct file scanning**: Reads session metadata directly from `.jsonl` files
-- **Parallel processing**: Uses rayon for fast scanning across many projects
-
 ## How it works
 
 Claude Code stores session data in `~/.claude/projects/`. This tool:
@@ -82,6 +81,7 @@ Claude Code stores session data in `~/.claude/projects/`. This tool:
 4. Filters out empty sessions and non-session files
 
 When you select a session:
+
 - **Resume** (default): Continues the existing session
 - **Fork** (`--fork`): Creates a new session with the conversation history
 

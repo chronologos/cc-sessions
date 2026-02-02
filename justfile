@@ -12,9 +12,12 @@ build:
 test:
     cargo test
 
-# Build and install to ~/.local/bin
+# Build and install to ~/.local/bin (with macOS signing)
 install: build
     cp target/release/cc-sessions ~/.local/bin/
+    @if [ "$(uname)" = "Darwin" ]; then \
+        codesign -s - -f ~/.local/bin/cc-sessions; \
+    fi
 
 # Run with arguments (e.g., just run -- --list)
 run *ARGS:

@@ -19,7 +19,7 @@
 //! Metadata is extracted directly from file contents (head + tail) rather than
 //! relying on `sessions-index.json` which is often stale.
 
-use crate::Session;
+use crate::{Session, SessionSource};
 use anyhow::{Context, Result};
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
@@ -40,6 +40,138 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects"))
 }
 
+/// Find all sessions from local and cached remotes.
+///
+/// Combines:
+/// - Local sessions from ~/.claude/projects
+/// - Cached remote sessions from each configured remote
+///
+/// Sessions are sorted by modified time (most recent first).
+pub fn find_all_sessions(
+    config: &crate::remote::Config,
+    remote_filter: Option<&str>,
+) -> Result<Vec<crate::Session>> {
+    use crate::remote;
+
+    let mut all_sessions = Vec::new();
+
+    // Load local sessions (unless filtering to a specific remote)
+    let include_local = remote_filter.is_none() || remote_filter == Some("local");
+    if include_local {
+        let local_dir = get_claude_projects_dir()?;
+        if local_dir.exists() {
+            let local = find_sessions(&local_dir)?;
+            all_sessions.extend(local);
+        }
+    }
+
+    // Load cached remote sessions
+    for (name, remote_config) in &config.remotes {
+        // Skip if filtering to a different remote
+        if let Some(filter) = remote_filter {
+            if filter != "local" && filter != name {
+                continue;
+            }
+        }
+
+        // Skip local filter when processing remotes
+        if remote_filter == Some("local") {
+            continue;
+        }
+
+        let cache_dir = match remote::get_remote_cache_dir(&config.settings, name) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+
+        if !cache_dir.exists() {
+            continue; // Not synced yet
+        }
+
+        let source = SessionSource::Remote {
+            name: name.clone(),
+            host: remote_config.host.clone(),
+            user: remote_config.user.clone(),
+        };
+
+        match find_sessions_with_source(&cache_dir, source) {
+            Ok(remote_sessions) => all_sessions.extend(remote_sessions),
+            Err(e) => {
+                eprintln!("Warning: Failed to load sessions from '{}': {}", name, e);
+            }
+        }
+    }
+
+    // Sort all sessions by modified time (most recent first)
+    all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(all_sessions)
+}
+
+/// Search all sessions (local and cached remotes) for a pattern.
+pub fn search_all_sessions(
+    config: &crate::remote::Config,
+    pattern: &str,
+    remote_filter: Option<&str>,
+) -> Result<Vec<crate::Session>> {
+    use crate::remote;
+
+    let mut all_sessions = Vec::new();
+
+    // Search local sessions (unless filtering to a specific remote)
+    let include_local = remote_filter.is_none() || remote_filter == Some("local");
+    if include_local {
+        let local_dir = get_claude_projects_dir()?;
+        if local_dir.exists() {
+            let local = search_sessions(&local_dir, pattern)?;
+            all_sessions.extend(local);
+        }
+    }
+
+    // Search cached remote sessions
+    for (name, remote_config) in &config.remotes {
+        // Skip if filtering to a different remote
+        if let Some(filter) = remote_filter {
+            if filter != "local" && filter != name {
+                continue;
+            }
+        }
+
+        // Skip local filter when processing remotes
+        if remote_filter == Some("local") {
+            continue;
+        }
+
+        let cache_dir = match remote::get_remote_cache_dir(&config.settings, name) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+
+        if !cache_dir.exists() {
+            continue;
+        }
+
+        let source = SessionSource::Remote {
+            name: name.clone(),
+            host: remote_config.host.clone(),
+            user: remote_config.user.clone(),
+        };
+
+        match search_sessions_with_source(&cache_dir, pattern, source) {
+            Ok(remote_sessions) => all_sessions.extend(remote_sessions),
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to search sessions from '{}': {}",
+                    name, e
+                );
+            }
+        }
+    }
+
+    // Sort all sessions by modified time (most recent first)
+    all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(all_sessions)
+}
+
 // =============================================================================
 // Session Loading
 // =============================================================================
@@ -49,6 +181,16 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
 /// This replaces the previous two-phase approach (index + orphan) with a single
 /// unified scan. All metadata is extracted directly from file contents.
 pub fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
+    find_sessions_with_source(projects_dir, SessionSource::Local)
+}
+
+/// Find sessions with a specific source tag.
+///
+/// Used by both local discovery and remote cache discovery.
+pub fn find_sessions_with_source(
+    projects_dir: &PathBuf,
+    source: SessionSource,
+) -> Result<Vec<Session>> {
     // Find all .jsonl files with valid UUID filenames
     let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
         .min_depth(2)
@@ -83,7 +225,7 @@ pub fn find_sessions(projects_dir: &PathBuf) -> Result<Vec<Session>> {
                 .file_name()?
                 .to_string_lossy()
                 .to_string();
-            extract_session_metadata(filepath, &parent_dir)
+            extract_session_metadata(filepath, &parent_dir, source.clone())
         })
         .collect();
 
@@ -114,7 +256,11 @@ fn is_valid_session_uuid(s: &str) -> bool {
 /// - HEAD (first ~50 lines): cwd, first user message
 /// - TAIL (last ~16KB): summary type entry, customTitle field
 /// - Filesystem: created/modified timestamps
-fn extract_session_metadata(filepath: &Path, parent_dir_name: &str) -> Option<Session> {
+fn extract_session_metadata(
+    filepath: &Path,
+    parent_dir_name: &str,
+    source: SessionSource,
+) -> Option<Session> {
     let id = filepath.file_stem()?.to_string_lossy().to_string();
 
     // Get timestamps from file metadata
@@ -149,6 +295,7 @@ fn extract_session_metadata(filepath: &Path, parent_dir_name: &str) -> Option<Se
         summary,
         name: custom_title,
         turn_count,
+        source,
     })
 }
 
@@ -323,6 +470,15 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 /// Finds sessions containing the pattern and extracts metadata directly
 /// from the matching files (no index dependency).
 pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
+    search_sessions_with_source(projects_dir, pattern, SessionSource::Local)
+}
+
+/// Search sessions with a specific source tag.
+pub fn search_sessions_with_source(
+    projects_dir: &PathBuf,
+    pattern: &str,
+    source: SessionSource,
+) -> Result<Vec<Session>> {
     let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
 
     // Find all .jsonl files with valid UUID filenames
@@ -373,7 +529,7 @@ pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Sess
                 .file_name()?
                 .to_string_lossy()
                 .to_string();
-            extract_session_metadata(filepath, &parent_dir)
+            extract_session_metadata(filepath, &parent_dir, source.clone())
         })
         .collect();
 

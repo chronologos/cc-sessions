@@ -1,4 +1,5 @@
 mod claude_code;
+mod remote;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,11 +42,57 @@ struct Args {
     /// Debug mode - show session IDs and stats
     #[arg(long)]
     debug: bool,
+
+    /// Filter to sessions from a specific remote (or "local")
+    #[arg(long, value_name = "NAME")]
+    remote: Option<String>,
+
+    /// Force sync all remotes before listing
+    #[arg(long)]
+    sync: bool,
+
+    /// Skip auto-sync (use cached data only)
+    #[arg(long)]
+    no_sync: bool,
+
+    /// Sync remotes and exit (for cron/scripting)
+    #[arg(long)]
+    sync_only: bool,
 }
 
 // =============================================================================
 // Session Model (abstraction layer)
 // =============================================================================
+
+/// Where a session originated from
+#[derive(Debug, Clone)]
+pub enum SessionSource {
+    /// Local session from ~/.claude/projects
+    Local,
+    /// Remote session synced via SSH
+    Remote {
+        /// Config key (e.g., "devbox")
+        name: String,
+        /// SSH alias or raw hostname/IP
+        host: String,
+        /// Only needed for raw hosts without SSH config
+        user: Option<String>,
+    },
+}
+
+impl SessionSource {
+    /// Display name for the source (e.g., "local", "devbox")
+    pub fn display_name(&self) -> &str {
+        match self {
+            SessionSource::Local => "local",
+            SessionSource::Remote { name, .. } => name,
+        }
+    }
+
+    pub fn is_local(&self) -> bool {
+        matches!(self, SessionSource::Local)
+    }
+}
 
 #[derive(Debug)]
 pub struct Session {
@@ -57,8 +104,9 @@ pub struct Session {
     pub modified: SystemTime,
     pub first_message: Option<String>,
     pub summary: Option<String>,
-    pub name: Option<String>, // customTitle from /rename - indicates important session
-    pub turn_count: usize,    // Number of user messages (conversation turns)
+    pub name: Option<String>,  // customTitle from /rename - indicates important session
+    pub turn_count: usize,     // Number of user messages (conversation turns)
+    pub source: SessionSource, // Where this session came from
 }
 
 // =============================================================================
@@ -74,13 +122,50 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let projects_dir = claude_code::get_claude_projects_dir()?;
+    // Load remote config
+    let config = remote::load_config()?;
 
-    if !projects_dir.exists() {
-        anyhow::bail!("No Claude sessions found at {:?}", projects_dir);
+    // Handle sync operations
+    if args.sync_only {
+        // Sync all remotes and exit
+        let results = remote::sync_all(&config)?;
+        for result in &results {
+            println!(
+                "Synced '{}' in {:.1}s",
+                result.remote_name,
+                result.duration.as_secs_f64()
+            );
+        }
+        if results.is_empty() {
+            println!("No remotes configured. Add remotes to ~/.config/cc-sessions/remotes.toml");
+        }
+        return Ok(());
     }
 
-    let mut sessions = claude_code::find_sessions(&projects_dir)?;
+    if args.sync {
+        // Force sync all remotes
+        let results = remote::sync_all(&config)?;
+        for result in &results {
+            eprintln!(
+                "Synced '{}' in {:.1}s",
+                result.remote_name,
+                result.duration.as_secs_f64()
+            );
+        }
+    } else if !args.no_sync && !config.remotes.is_empty() {
+        // Auto-sync stale remotes
+        let results = remote::sync_if_stale(&config)?;
+        for result in &results {
+            eprintln!(
+                "Auto-synced '{}' in {:.1}s",
+                result.remote_name,
+                result.duration.as_secs_f64()
+            );
+        }
+    }
+
+    // Find sessions from all sources (local + remotes)
+    let mut sessions = claude_code::find_all_sessions(&config, args.remote.as_deref())?;
 
     // Filter by project name if specified
     if let Some(ref filter) = args.project {
@@ -97,13 +182,16 @@ fn main() -> Result<()> {
         if args.project.is_some() {
             anyhow::bail!("No sessions found matching project filter");
         }
+        if let Some(ref remote_name) = args.remote {
+            anyhow::bail!("No sessions found for remote '{}'", remote_name);
+        }
         anyhow::bail!("No sessions found");
     }
 
     if args.list {
         print_sessions(&sessions, args.count, args.debug);
     } else {
-        interactive_mode(&sessions, args.fork)?;
+        interactive_mode(&sessions, args.fork, &config)?;
     }
 
     Ok(())
@@ -116,45 +204,50 @@ fn main() -> Result<()> {
 fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
     if debug {
         println!(
-            "{:<6} {:<6} {:<16} {:<40} SUMMARY",
-            "CREAT", "MOD", "PROJECT", "ID"
+            "{:<6} {:<6} {:<8} {:<16} {:<40} SUMMARY",
+            "CREAT", "MOD", "SOURCE", "PROJECT", "ID"
         );
-        println!("{}", "─".repeat(110));
+        println!("{}", "─".repeat(120));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
+            let source = session.source.display_name();
             let id_short = if session.id.len() > 36 {
                 &session.id[..36]
             } else {
                 &session.id
             };
-            let desc = format_session_desc(session, 35);
+            let desc = format_session_desc(session, 30);
 
             println!(
-                "{:<6} {:<6} {:<16} {:<40} {}",
-                created, modified, session.project, id_short, desc
+                "{:<6} {:<6} {:<8} {:<16} {:<40} {}",
+                created, modified, source, session.project, id_short, desc
             );
         }
 
-        println!("{}", "─".repeat(110));
+        println!("{}", "─".repeat(120));
         println!("Total: {} sessions", sessions.len());
     } else {
-        println!("{:<6} {:<6} {:<16} SUMMARY", "CREAT", "MOD", "PROJECT");
-        println!("{}", "─".repeat(90));
+        println!(
+            "{:<6} {:<6} {:<8} {:<16} SUMMARY",
+            "CREAT", "MOD", "SOURCE", "PROJECT"
+        );
+        println!("{}", "─".repeat(100));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
-            let desc = format_session_desc(session, 55);
+            let source = session.source.display_name();
+            let desc = format_session_desc(session, 50);
 
             println!(
-                "{:<6} {:<6} {:<16} {}",
-                created, modified, session.project, desc
+                "{:<6} {:<6} {:<8} {:<16} {}",
+                created, modified, source, session.project, desc
             );
         }
 
-        println!("{}", "─".repeat(90));
+        println!("{}", "─".repeat(100));
         println!("Use 'cc-sessions' for interactive picker, --fork to fork");
     }
 }
@@ -609,15 +702,105 @@ fn highlight_match(text: &str, pattern: &str) -> String {
 }
 
 // =============================================================================
+// Session Resume
+// =============================================================================
+
+/// Resume or fork a session, handling both local and remote sessions.
+fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> Result<()> {
+    use std::process::Command;
+
+    let action = if fork { "Forking" } else { "Resuming" };
+    let fork_flag = if fork { " --fork-session" } else { "" };
+    let project_path = &session.project_path;
+
+    // Validate project path
+    if project_path.is_empty() {
+        eprintln!("Error: Session {} has no project path recorded", session.id);
+        eprintln!("Session file: {}", filepath.display());
+        return Err(anyhow::anyhow!("Cannot resume: no project path"));
+    }
+
+    match &session.source {
+        SessionSource::Local => {
+            // Local session - verify directory exists
+            if !std::path::Path::new(project_path).exists() {
+                eprintln!(
+                    "Error: Project directory no longer exists: {}",
+                    project_path
+                );
+                eprintln!("Session file: {}", filepath.display());
+                return Err(anyhow::anyhow!(
+                    "Cannot resume: directory '{}' not found",
+                    project_path
+                ));
+            }
+
+            println!(
+                "{} session {} in {}",
+                action, session.id, session.project_path
+            );
+
+            let cmd = format!(
+                "cd '{}' && claude -r '{}'{}",
+                project_path, session.id, fork_flag
+            );
+            let status = Command::new("zsh").args(["-c", &cmd]).status()?;
+
+            if !status.success() {
+                let code = status.code().unwrap_or(-1);
+                eprintln!("Claude exited with code {}", code);
+                eprintln!("Command was: {}", cmd);
+                eprintln!("Session file: {}", filepath.display());
+            }
+        }
+        SessionSource::Remote { name, host, user } => {
+            // Remote session - SSH to the remote and resume there
+            let ssh_target = match user {
+                Some(u) => format!("{}@{}", u, host),
+                None => host.clone(),
+            };
+
+            println!(
+                "{} remote session {} on {} in {}",
+                action, session.id, name, session.project_path
+            );
+
+            // Build the remote command
+            // -t allocates a pseudo-TTY (required for claude's interactive mode)
+            let remote_cmd = format!(
+                "cd '{}' && claude -r '{}'{}",
+                project_path, session.id, fork_flag
+            );
+
+            let status = Command::new("ssh")
+                .args(["-t", &ssh_target, &remote_cmd])
+                .status()?;
+
+            if !status.success() {
+                let code = status.code().unwrap_or(-1);
+                eprintln!("SSH exited with code {}", code);
+                eprintln!(
+                    "Command was: ssh -t {} \"{}\"",
+                    ssh_target, remote_cmd
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Interactive Mode (skim - no external dependencies)
 // =============================================================================
 
-fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
+fn interactive_mode(
+    sessions: &[Session],
+    fork: bool,
+    config: &remote::Config,
+) -> Result<()> {
     use skim::prelude::*;
     use std::collections::HashMap;
-    use std::process::Command;
-
-    let projects_dir = claude_code::get_claude_projects_dir()?;
 
     // Start with all sessions; may be filtered by transcript search
     let mut current_sessions: Vec<&Session> = sessions.iter().collect();
@@ -652,11 +835,12 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
 
         for session in &current_sessions {
             let display = format!(
-                "{:<6} {:<6} {:<12} {}",
+                "{:<6} {:<6} {:<8} {:<12} {}",
                 format_time_relative(session.created),
                 format_time_relative(session.modified),
+                session.source.display_name(),
                 session.project,
-                format_session_desc(session, 50),
+                format_session_desc(session, 45),
             );
             session_lookup.insert(display.clone(), (session, session.filepath.clone()));
 
@@ -691,8 +875,8 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
                         continue; // No query, just re-show
                     }
 
-                    // Search transcripts for the query
-                    match claude_code::search_sessions(&projects_dir, query) {
+                    // Search transcripts across all sources
+                    match claude_code::search_all_sessions(config, query, None) {
                         Ok(matched) => {
                             // Filter to matched session IDs
                             let matched_ids: std::collections::HashSet<_> =
@@ -719,46 +903,7 @@ fn interactive_mode(sessions: &[Session], fork: bool) -> Result<()> {
                         .get(&display_text)
                         .context("Session not found in lookup table")?;
 
-                    let action = if fork { "Forking" } else { "Resuming" };
-                    println!(
-                        "{} session {} in {}",
-                        action, session.id, session.project_path
-                    );
-
-                    let fork_flag = if fork { " --fork-session" } else { "" };
-                    let project_path = &session.project_path;
-
-                    // Validate project path exists before trying to resume
-                    if project_path.is_empty() {
-                        eprintln!("Error: Session {} has no project path recorded", session.id);
-                        eprintln!("Session file: {}", filepath.display());
-                        return Err(anyhow::anyhow!("Cannot resume: no project path"));
-                    }
-
-                    if !std::path::Path::new(project_path).exists() {
-                        eprintln!(
-                            "Error: Project directory no longer exists: {}",
-                            project_path
-                        );
-                        eprintln!("Session file: {}", filepath.display());
-                        return Err(anyhow::anyhow!(
-                            "Cannot resume: directory '{}' not found",
-                            project_path
-                        ));
-                    }
-
-                    let cmd = format!(
-                        "cd '{}' && claude -r '{}'{}",
-                        project_path, session.id, fork_flag
-                    );
-                    let status = Command::new("zsh").args(["-c", &cmd]).status()?;
-
-                    if !status.success() {
-                        let code = status.code().unwrap_or(-1);
-                        eprintln!("Claude exited with code {}", code);
-                        eprintln!("Command was: {}", cmd);
-                        eprintln!("Session file: {}", filepath.display());
-                    }
+                    resume_session(session, filepath, fork)?;
                     return Ok(());
                 }
             }
