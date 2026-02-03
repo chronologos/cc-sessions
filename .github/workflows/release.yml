@@ -45,16 +45,20 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: cc-sessions-macos-arm64
-          # Linux
-          - target: x86_64-unknown-linux-gnu
+          # Linux (musl for maximum compatibility - no glibc dependency)
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: cc-sessions-linux-x86_64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             name: cc-sessions-linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install musl tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
