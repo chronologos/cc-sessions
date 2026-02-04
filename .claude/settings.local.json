@@ -6,12 +6,14 @@
       "Bash(cargo build:*)",
       "Bash(target/release/cc-session:*)",
       "Bash(./target/release/cc-session:*)",
-      "Bash(just install:*)"
+      "Bash(just install:*)",
+      "Bash(eza:*)",
+      "Bash(~/.local/bin/cc-sessions:*)"
     ]
   },
+  "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": [
     "anki",
     "qmd"
-  ],
-  "enableAllProjectMcpServers": true
+  ]
 }

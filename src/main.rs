@@ -43,6 +43,10 @@ struct Args {
     #[arg(long)]
     debug: bool,
 
+    /// Include forked sessions in list mode
+    #[arg(long)]
+    include_forks: bool,
+
     /// Filter to sessions from a specific remote (or "local")
     #[arg(long, value_name = "NAME")]
     remote: Option<String>,
@@ -104,9 +108,10 @@ pub struct Session {
     pub modified: SystemTime,
     pub first_message: Option<String>,
     pub summary: Option<String>,
-    pub name: Option<String>,  // customTitle from /rename - indicates important session
-    pub turn_count: usize,     // Number of user messages (conversation turns)
-    pub source: SessionSource, // Where this session came from
+    pub name: Option<String>,       // customTitle from /rename - indicates important session
+    pub turn_count: usize,          // Number of user messages (conversation turns)
+    pub source: SessionSource,      // Where this session came from
+    pub forked_from: Option<String>, // Parent session ID if this is a fork
 }
 
 // =============================================================================
@@ -189,9 +194,10 @@ fn main() -> Result<()> {
     }
 
     if args.list {
-        print_sessions(&sessions, args.count, args.debug);
+        let list_sessions = filter_forks_for_list(&sessions, args.include_forks);
+        print_sessions(&list_sessions, args.count, args.debug);
     } else {
-        interactive_mode(&sessions, args.fork, &config)?;
+        interactive_mode(&sessions, args.fork, args.debug, &config)?;
     }
 
     Ok(())
@@ -201,18 +207,19 @@ fn main() -> Result<()> {
 // Display Functions
 // =============================================================================
 
-fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
+fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
     if debug {
         println!(
-            "{:<6} {:<6} {:<8} {:<16} {:<40} SUMMARY",
-            "CREAT", "MOD", "SOURCE", "PROJECT", "ID"
+            "{:<6} {:<6} {:<4} {:<8} {:<16} {:<40} SUMMARY",
+            "CREAT", "MOD", "FORK", "SOURCE", "PROJECT", "ID"
         );
-        println!("{}", "─".repeat(120));
+        println!("{}", "─".repeat(130));
 
         for session in sessions.iter().take(count) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
             let source = session.source.display_name();
+            let fork_indicator = if session.forked_from.is_some() { "↳" } else { "" };
             let id_short = if session.id.len() > 36 {
                 &session.id[..36]
             } else {
@@ -221,12 +228,12 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
             let desc = format_session_desc(session, 30);
 
             println!(
-                "{:<6} {:<6} {:<8} {:<16} {:<40} {}",
-                created, modified, source, session.project, id_short, desc
+                "{:<6} {:<6} {:<4} {:<8} {:<16} {:<40} {}",
+                created, modified, fork_indicator, source, session.project, id_short, desc
             );
         }
 
-        println!("{}", "─".repeat(120));
+        println!("{}", "─".repeat(130));
         println!("Total: {} sessions", sessions.len());
     } else {
         println!(
@@ -240,6 +247,11 @@ fn print_sessions(sessions: &[Session], count: usize, debug: bool) {
             let modified = format_time_relative(session.modified);
             let source = session.source.display_name();
             let desc = format_session_desc(session, 50);
+            let desc = if session.forked_from.is_some() {
+                format!("↳ {}", desc)
+            } else {
+                desc
+            };
 
             println!(
                 "{:<6} {:<6} {:<8} {:<16} {}",
@@ -300,6 +312,17 @@ fn format_session_desc(session: &Session, max_chars: usize) -> String {
             .map(|s| s.chars().take(max_chars).collect())
             .unwrap_or_default()
     }
+}
+
+fn filter_forks_for_list<'a>(sessions: &'a [Session], include_forks: bool) -> Vec<&'a Session> {
+    if include_forks {
+        return sessions.iter().collect();
+    }
+
+    sessions
+        .iter()
+        .filter(|s| s.forked_from.is_none())
+        .collect()
 }
 
 /// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
@@ -724,28 +747,152 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
 // Interactive Mode (skim - no external dependencies)
 // =============================================================================
 
+/// Build a map of parent session ID → child sessions (forks)
+fn build_fork_tree<'a>(
+    sessions: &[&'a Session],
+) -> std::collections::HashMap<String, Vec<&'a Session>> {
+    use std::collections::HashMap;
+    let mut children_map: HashMap<String, Vec<&Session>> = HashMap::new();
+
+    for session in sessions {
+        if let Some(ref parent_id) = session.forked_from {
+            children_map
+                .entry(parent_id.clone())
+                .or_default()
+                .push(session);
+        }
+    }
+
+    // Sort children by modified time (most recent first)
+    for children in children_map.values_mut() {
+        children.sort_by(|a, b| b.modified.cmp(&a.modified));
+    }
+
+    children_map
+}
+
+/// Collect a session and all its descendants into a vec
+fn collect_subtree<'a>(
+    session: &'a Session,
+    children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
+    result: &mut Vec<&'a Session>,
+) {
+    result.push(session);
+    if let Some(children) = children_map.get(&session.id) {
+        for child in children {
+            collect_subtree(child, children_map, result);
+        }
+    }
+}
+
+/// Build header showing current navigation state
+fn build_subtree_header(
+    search_pattern: &Option<String>,
+    fork: bool,
+    focus: Option<&String>,
+    session_by_id: &std::collections::HashMap<&str, &Session>,
+) -> String {
+    let nav_hint = if focus.is_some() {
+        "← back"
+    } else {
+        "→ into forks"
+    };
+
+    let focus_info = focus
+        .and_then(|id| session_by_id.get(id.as_str()))
+        .map(|s| {
+            let desc = format_session_desc(s, 30);
+            format!(" [{}]", desc)
+        })
+        .unwrap_or_default();
+
+    match (search_pattern, fork) {
+        (Some(pat), true) => format!(
+            "FORK │ search: \"{}\" │ {} │ {}",
+            pat, nav_hint, focus_info
+        ),
+        (Some(pat), false) => format!("search: \"{}\" │ {} │ {}", pat, nav_hint, focus_info),
+        (None, true) => format!("FORK mode │ {}{}", nav_hint, focus_info),
+        (None, false) => format!("Select session │ {}{}", nav_hint, focus_info),
+    }
+}
+
+/// Simple session row format (no tree glyphs)
+fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> String {
+    let created = format_time_relative(session.created);
+    let modified = format_time_relative(session.modified);
+    let source = session.source.display_name();
+    let id_prefix = if debug {
+        format!("{:<6} ", &session.id[..5.min(session.id.len())])
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{}{}{:<6} {:<6} {:<8} {:<12} {}",
+        prefix,
+        id_prefix,
+        created,
+        modified,
+        source,
+        session.project,
+        format_session_desc(session, 40),
+    )
+}
+
 fn interactive_mode(
     sessions: &[Session],
     fork: bool,
+    debug: bool,
     config: &remote::Config,
 ) -> Result<()> {
     use skim::prelude::*;
     use std::collections::HashMap;
 
-    // Start with all sessions; may be filtered by transcript search
-    let mut current_sessions: Vec<&Session> = sessions.iter().collect();
+    // Build session lookup and children map once
+    let session_by_id: HashMap<&str, &Session> =
+        sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+    let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
+
+    // Navigation state - stack tracks drill-down history (empty = root view)
     let mut search_pattern: Option<String> = None;
+    let mut focus_stack: Vec<String> = Vec::new();
 
     loop {
-        let header = match (&search_pattern, fork) {
-            (Some(pat), true) => format!(
-                "FORK │ search: \"{}\" │ ctrl+s: new search │ esc: clear",
-                pat
-            ),
-            (Some(pat), false) => format!("search: \"{}\" │ ctrl+s: new search │ esc: clear", pat),
-            (None, true) => "FORK mode │ ctrl+s: transcript search".to_string(),
-            (None, false) => "Select session │ ctrl+s: transcript search".to_string(),
+        // Build visible sessions based on focus
+        let focus = focus_stack.last();
+        let visible_sessions: Vec<&Session> = if let Some(focus_id) = focus {
+            // Show focused session + direct children only (not all descendants)
+            let mut result = Vec::new();
+            if let Some(session) = session_by_id.get(focus_id.as_str()) {
+                result.push(*session);
+                if let Some(children) = children_map.get(focus_id) {
+                    result.extend(children.iter());
+                }
+            }
+            result
+        } else {
+            // Root view: only show sessions without a parent (or orphaned forks)
+            sessions
+                .iter()
+                .filter(|s| {
+                    s.forked_from
+                        .as_ref()
+                        .map(|p| !session_by_id.contains_key(p.as_str()))
+                        .unwrap_or(true)
+                })
+                .collect()
         };
+
+        // Build display info
+        let mut session_info: HashMap<String, (bool, Option<&str>)> = HashMap::new();
+        for session in &visible_sessions {
+            let has_children = children_map.contains_key(&session.id);
+            let parent_id = session.forked_from.as_deref();
+            session_info.insert(session.id.clone(), (has_children, parent_id));
+        }
+
+        let header = build_subtree_header(&search_pattern, fork, focus, &session_by_id);
 
         let options = SkimOptionsBuilder::default()
             .height(Some("100%"))
@@ -753,30 +900,35 @@ fn interactive_mode(
             .preview_window(Some("right:50%:wrap"))
             .header(Some(&header))
             .prompt(Some("filter> "))
-            .bind(vec!["ctrl-s:accept"]) // ctrl+s triggers transcript search
+            .reverse(false)
+            .nosort(true)
+            .bind(vec![
+                "ctrl-s:accept", // transcript search
+                "right:accept",  // drill into subtree
+                "left:accept",   // go up to parent
+            ])
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
 
         let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
 
-        // Build lookup table: display text -> session data
-        // This is more reliable than downcasting, which can fail with skim's internal wrapping
-        let mut session_lookup: HashMap<String, (&Session, PathBuf)> = HashMap::new();
-
-        for session in &current_sessions {
-            let display = format!(
-                "{:<6} {:<6} {:<8} {:<12} {}",
-                format_time_relative(session.created),
-                format_time_relative(session.modified),
-                session.source.display_name(),
-                session.project,
-                format_session_desc(session, 45),
-            );
-            session_lookup.insert(display.clone(), (session, session.filepath.clone()));
+        for session in &visible_sessions {
+            let (has_children, _) = session_info.get(&session.id).unwrap_or(&(false, None));
+            let is_focus = focus.map(|f| f == &session.id).unwrap_or(false);
+            let prefix = if is_focus {
+                "▷ " // Hollow triangle for focused parent
+            } else if *has_children {
+                "▶ " // Filled triangle for items with children
+            } else {
+                "  " // No indicator for leaf nodes
+            };
+            let display = format_session_row_simple(prefix, session, debug);
 
             let item = SessionItem {
                 filepath: session.filepath.clone(),
                 display,
+                match_text: format_session_desc(session, 100),
+                session_id: session.id.clone(),
                 search_pattern: search_pattern.clone(),
             };
             let _ = tx.send(Arc::new(item));
@@ -787,34 +939,29 @@ fn interactive_mode(
 
         match output {
             Some(out) if out.is_abort => {
-                // Esc pressed - if searching, clear search; otherwise exit
+                // Esc: if in subtree, go to root; if searching, clear; otherwise exit
+                if !focus_stack.is_empty() {
+                    focus_stack.clear();
+                    continue;
+                }
                 if search_pattern.is_some() {
                     search_pattern = None;
-                    current_sessions = sessions.iter().collect();
                     continue;
                 }
                 return Ok(());
             }
             Some(out) => {
-                // Check if ctrl+s was pressed (query will be in out.query)
                 let query = out.query.trim();
 
-                // ctrl+s triggers search if there's a query
+                // ctrl+s triggers transcript search
                 if out.final_key == Key::Ctrl('s') {
                     if query.is_empty() {
-                        continue; // No query, just re-show
+                        continue;
                     }
-
-                    // Search transcripts across all sources
                     match claude_code::search_all_sessions(config, query, None) {
-                        Ok(matched) => {
-                            // Filter to matched session IDs
-                            let matched_ids: std::collections::HashSet<_> =
-                                matched.iter().map(|s| &s.id).collect();
-                            current_sessions = sessions
-                                .iter()
-                                .filter(|s| matched_ids.contains(&s.id))
-                                .collect();
+                        Ok(_matched) => {
+                            // For now, just set search pattern for preview highlighting
+                            // TODO: filter to matched sessions
                             search_pattern = Some(query.to_string());
                         }
                         Err(e) => {
@@ -824,17 +971,36 @@ fn interactive_mode(
                     continue;
                 }
 
-                // Normal selection (Enter)
-                if let Some(item) = out.selected_items.first() {
-                    // Use text() to get display string, then look up in our table
-                    // This is more reliable than downcasting which can fail with skim
-                    let display_text = item.text().to_string();
-                    let (session, filepath) = session_lookup
-                        .get(&display_text)
-                        .context("Session not found in lookup table")?;
+                // Right: drill into subtree if session has children
+                if out.final_key == Key::Right {
+                    if let Some(item) = out.selected_items.first() {
+                        let selected_id = item.output().to_string();
+                        // Don't push if already viewing this session's subtree
+                        let already_focused = focus_stack.last().map(|f| f == &selected_id).unwrap_or(false);
+                        if !already_focused {
+                            if let Some((has_children, _)) = session_info.get(&selected_id) {
+                                if *has_children {
+                                    focus_stack.push(selected_id);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
 
-                    resume_session(session, filepath, fork)?;
-                    return Ok(());
+                // Left: pop navigation stack (go back)
+                if out.final_key == Key::Left {
+                    focus_stack.pop();
+                    continue;
+                }
+
+                // Enter: select session
+                if let Some(item) = out.selected_items.first() {
+                    let selected_id = item.output().to_string();
+                    if let Some(session) = session_by_id.get(selected_id.as_str()) {
+                        resume_session(session, &session.filepath, fork)?;
+                        return Ok(());
+                    }
                 }
             }
             None => return Ok(()),
@@ -846,12 +1012,22 @@ fn interactive_mode(
 struct SessionItem {
     filepath: PathBuf,
     display: String,
+    match_text: String,
+    session_id: String,
     search_pattern: Option<String>, // When set, preview shows matching lines
 }
 
 impl SkimItem for SessionItem {
     fn text(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.display)
+        Cow::Borrowed(&self.match_text)
+    }
+
+    fn display<'a>(&'a self, _context: DisplayContext<'a>) -> AnsiString<'a> {
+        AnsiString::from(self.display.as_str())
+    }
+
+    fn output(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.session_id)
     }
 
     fn preview(&self, _context: PreviewContext) -> ItemPreview {
@@ -986,5 +1162,129 @@ mod tests {
         use std::time::Duration;
         let time = SystemTime::now() - Duration::from_secs(604800 * 3);
         assert_eq!(format_time_relative(time), "3w");
+    }
+
+    // =========================================================================
+    // Fork list and tree view
+    // =========================================================================
+
+    fn test_session(id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            project: "test-project".to_string(),
+            project_path: "/tmp/test-project".to_string(),
+            filepath: PathBuf::from(format!("/tmp/{}.jsonl", id)),
+            created: SystemTime::now(),
+            modified: SystemTime::now(),
+            first_message: None,
+            summary: Some("test summary".to_string()),
+            name: None,
+            turn_count: 1,
+            source: SessionSource::Local,
+            forked_from: None,
+        }
+    }
+
+    #[test]
+    fn list_mode_excludes_forks_by_default() {
+        let parent = test_session("parent");
+        let mut fork = test_session("fork");
+        fork.forked_from = Some("parent".to_string());
+
+        let sessions = vec![parent, fork];
+        let visible = filter_forks_for_list(&sessions, false);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "parent");
+    }
+
+    // =========================================================================
+    // Fork tree and subtree collection
+    // =========================================================================
+
+    #[test]
+    fn build_fork_tree_maps_parent_to_children() {
+        let root = test_session("root");
+        let mut child1 = test_session("child1");
+        child1.forked_from = Some("root".to_string());
+        let mut child2 = test_session("child2");
+        child2.forked_from = Some("root".to_string());
+
+        let sessions: Vec<&Session> = vec![&root, &child1, &child2];
+        let children_map = build_fork_tree(&sessions);
+
+        assert!(children_map.contains_key("root"));
+        assert_eq!(children_map.get("root").unwrap().len(), 2);
+        assert!(!children_map.contains_key("child1"));
+        assert!(!children_map.contains_key("child2"));
+    }
+
+    #[test]
+    fn build_fork_tree_handles_nested_forks() {
+        // root -> child -> grandchild
+        let root = test_session("root");
+        let mut child = test_session("child");
+        child.forked_from = Some("root".to_string());
+        let mut grandchild = test_session("grandchild");
+        grandchild.forked_from = Some("child".to_string());
+
+        let sessions: Vec<&Session> = vec![&root, &child, &grandchild];
+        let children_map = build_fork_tree(&sessions);
+
+        assert_eq!(children_map.get("root").unwrap().len(), 1);
+        assert_eq!(children_map.get("child").unwrap().len(), 1);
+        assert!(!children_map.contains_key("grandchild"));
+    }
+
+    #[test]
+    fn collect_subtree_includes_all_descendants() {
+        // root -> child1, child2
+        // child1 -> grandchild
+        let root = test_session("root");
+        let mut child1 = test_session("child1");
+        child1.forked_from = Some("root".to_string());
+        let mut child2 = test_session("child2");
+        child2.forked_from = Some("root".to_string());
+        let mut grandchild = test_session("grandchild");
+        grandchild.forked_from = Some("child1".to_string());
+
+        let sessions: Vec<&Session> = vec![&root, &child1, &child2, &grandchild];
+        let children_map = build_fork_tree(&sessions);
+
+        let mut result = Vec::new();
+        collect_subtree(&root, &children_map, &mut result);
+
+        assert_eq!(result.len(), 4);
+        let ids: Vec<&str> = result.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"root"));
+        assert!(ids.contains(&"child1"));
+        assert!(ids.contains(&"child2"));
+        assert!(ids.contains(&"grandchild"));
+    }
+
+    #[test]
+    fn collect_subtree_from_middle_excludes_siblings() {
+        // root -> child1, child2
+        // child1 -> grandchild
+        let root = test_session("root");
+        let mut child1 = test_session("child1");
+        child1.forked_from = Some("root".to_string());
+        let mut child2 = test_session("child2");
+        child2.forked_from = Some("root".to_string());
+        let mut grandchild = test_session("grandchild");
+        grandchild.forked_from = Some("child1".to_string());
+
+        let sessions: Vec<&Session> = vec![&root, &child1, &child2, &grandchild];
+        let children_map = build_fork_tree(&sessions);
+
+        let mut result = Vec::new();
+        collect_subtree(&child1, &children_map, &mut result);
+
+        assert_eq!(result.len(), 2);
+        let ids: Vec<&str> = result.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"child1"));
+        assert!(ids.contains(&"grandchild"));
+        assert!(!ids.contains(&"root"));
+        assert!(!ids.contains(&"child2"));
     }
 }

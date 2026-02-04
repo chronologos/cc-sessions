@@ -231,7 +231,7 @@ fn is_valid_session_file(path: &Path) -> bool {
 /// Extract all session metadata from a .jsonl file.
 ///
 /// Reads:
-/// - HEAD (first ~50 lines): cwd, first user message
+/// - HEAD (first ~50 lines): cwd, first user message, forkedFrom
 /// - TAIL (last ~16KB): summary type entry, customTitle field
 /// - Filesystem: created/modified timestamps
 fn extract_session_metadata(
@@ -247,7 +247,7 @@ fn extract_session_metadata(
     let created = metadata.created().unwrap_or(modified);
 
     // Extract metadata from file head
-    let (project_path, first_message) = read_file_head(filepath);
+    let head = read_file_head(filepath);
 
     // Extract metadata from file tail (summary, customTitle)
     let (summary, custom_title) = read_file_tail(filepath);
@@ -256,35 +256,44 @@ fn extract_session_metadata(
     let turn_count = count_turns(filepath);
 
     // Skip "empty" sessions that have no user content
-    if project_path.is_empty() && first_message.is_none() && summary.is_none() {
+    if head.project_path.is_empty() && head.first_prompt.is_none() && summary.is_none() {
         return None;
     }
 
-    let project = extract_project_name(&project_path, parent_dir_name);
+    let project = extract_project_name(&head.project_path, parent_dir_name);
 
     Some(Session {
         id,
         project,
-        project_path,
+        project_path: head.project_path,
         filepath: filepath.to_path_buf(),
         created,
         modified,
-        first_message,
+        first_message: head.first_prompt,
         summary,
         name: custom_title,
         turn_count,
         source,
+        forked_from: head.forked_from,
     })
 }
 
-/// Read the head of a session file to extract cwd and first user message
-fn read_file_head(filepath: &Path) -> (String, Option<String>) {
+/// Metadata extracted from session file head
+#[derive(Default)]
+struct HeadMetadata {
+    project_path: String,
+    first_prompt: Option<String>,
+    forked_from: Option<String>,
+}
+
+/// Read the head of a session file to extract cwd, first user message, and fork parent
+fn read_file_head(filepath: &Path) -> HeadMetadata {
     let mut project_path = String::new();
     let mut first_prompt = None;
+    let mut forked_from = None;
 
-    let file = match File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return (project_path, first_prompt),
+    let Ok(file) = File::open(filepath) else {
+        return HeadMetadata::default();
     };
     let reader = BufReader::new(file);
 
@@ -304,6 +313,17 @@ fn read_file_head(filepath: &Path) -> (String, Option<String>) {
                 }
             }
 
+            // Extract forkedFrom.sessionId (present on entries if this is a forked session)
+            if forked_from.is_none() {
+                if let Some(parent_id) = entry
+                    .get("forkedFrom")
+                    .and_then(|f| f.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                {
+                    forked_from = Some(parent_id.to_string());
+                }
+            }
+
             // Extract first user prompt
             if first_prompt.is_none() && entry_type == Some("user") {
                 if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
@@ -317,14 +337,18 @@ fn read_file_head(filepath: &Path) -> (String, Option<String>) {
                 }
             }
 
-            // Stop early if we have both
-            if !project_path.is_empty() && first_prompt.is_some() {
+            // Stop early if we have all three
+            if !project_path.is_empty() && first_prompt.is_some() && forked_from.is_some() {
                 break;
             }
         }
     }
 
-    (project_path, first_prompt)
+    HeadMetadata {
+        project_path,
+        first_prompt,
+        forked_from,
+    }
 }
 
 /// Read the tail of a session file to extract summary and customTitle
@@ -764,6 +788,156 @@ mod tests {
 
         // Empty sessions should be filtered out
         assert_eq!(sessions.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    // =========================================================================
+    // Fork detection tests
+    // =========================================================================
+
+    #[test]
+    fn find_sessions_extracts_forked_from() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-fork-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-patsy-camelot");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let parent_uuid = test_uuid(10);
+        let fork_uuid = test_uuid(11);
+
+        // Parent session (no forkedFrom)
+        let parent_path = project_dir.join(format!("{}.jsonl", parent_uuid));
+        fs::write(
+            &parent_path,
+            r#"{"type":"user","message":{"role":"user","content":"What is your quest?"},"cwd":"/Users/patsy/camelot","sessionId":"00000010-0010-0010-0010-00000000000a"}"#,
+        )
+        .unwrap();
+
+        // Forked session (has forkedFrom pointing to parent)
+        let fork_path = project_dir.join(format!("{}.jsonl", fork_uuid));
+        fs::write(
+            &fork_path,
+            r#"{"type":"user","message":{"role":"user","content":"What is your quest?"},"cwd":"/Users/patsy/camelot","sessionId":"0000000b-000b-000b-000b-00000000000b","forkedFrom":{"sessionId":"00000010-0010-0010-0010-00000000000a","messageUuid":"abc123"}}"#,
+        )
+        .unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        assert_eq!(sessions.len(), 2);
+
+        // Find parent and fork
+        let parent = sessions.iter().find(|s| s.id == parent_uuid).unwrap();
+        let fork = sessions.iter().find(|s| s.id == fork_uuid).unwrap();
+
+        // Parent should have no forked_from
+        assert_eq!(parent.forked_from, None);
+
+        // Fork should point to parent
+        assert_eq!(
+            fork.forked_from,
+            Some("00000010-0010-0010-0010-00000000000a".to_string())
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn find_sessions_multiple_forks_same_parent() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-multi-fork-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-tim-enchanter");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let parent_uuid = test_uuid(20);
+        let fork1_uuid = test_uuid(21);
+        let fork2_uuid = test_uuid(22);
+
+        // Parent session
+        let parent_path = project_dir.join(format!("{}.jsonl", parent_uuid));
+        fs::write(
+            &parent_path,
+            r#"{"type":"user","message":{"role":"user","content":"What manner of man are you?"},"cwd":"/Users/tim/enchanter"}"#,
+        )
+        .unwrap();
+
+        // Fork 1
+        let fork1_path = project_dir.join(format!("{}.jsonl", fork1_uuid));
+        fs::write(
+            &fork1_path,
+            r#"{"type":"user","message":{"role":"user","content":"What manner of man are you?"},"cwd":"/Users/tim/enchanter","forkedFrom":{"sessionId":"00000014-0014-0014-0014-000000000014","messageUuid":"msg1"}}"#,
+        )
+        .unwrap();
+
+        // Fork 2
+        let fork2_path = project_dir.join(format!("{}.jsonl", fork2_uuid));
+        fs::write(
+            &fork2_path,
+            r#"{"type":"user","message":{"role":"user","content":"What manner of man are you?"},"cwd":"/Users/tim/enchanter","forkedFrom":{"sessionId":"00000014-0014-0014-0014-000000000014","messageUuid":"msg2"}}"#,
+        )
+        .unwrap();
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+
+        assert_eq!(sessions.len(), 3);
+
+        // Both forks should point to the same parent
+        let fork1 = sessions.iter().find(|s| s.id == fork1_uuid).unwrap();
+        let fork2 = sessions.iter().find(|s| s.id == fork2_uuid).unwrap();
+
+        assert_eq!(fork1.forked_from, fork2.forked_from);
+        assert_eq!(
+            fork1.forked_from,
+            Some("00000014-0014-0014-0014-000000000014".to_string())
+        );
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_head_prefers_first_forked_from() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-fork-order-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"hello"},"forkedFrom":{"sessionId":"parent-1","messageUuid":"m1"}}
+{"type":"assistant","message":"hi"}
+{"type":"user","message":{"role":"user","content":"later"},"forkedFrom":{"sessionId":"parent-2","messageUuid":"m2"}}"#,
+        )
+        .unwrap();
+
+        let head = read_file_head(&session_path);
+        assert_eq!(head.forked_from, Some("parent-1".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_head_extracts_forked_from_early() {
+        // Test that forkedFrom is extracted even if it appears on a later entry
+        // (not just the first line)
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-fork-pos-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"progress","data":"starting"}
+{"type":"progress","cwd":"/Users/test/project","data":"hook"}
+{"type":"user","message":{"role":"user","content":"hello"},"forkedFrom":{"sessionId":"parent-session-id","messageUuid":"msg1"}}
+{"type":"assistant","message":"hi"}"#,
+        )
+        .unwrap();
+
+        let head = read_file_head(&session_path);
+
+        assert_eq!(head.project_path, "/Users/test/project");
+        assert_eq!(head.forked_from, Some("parent-session-id".to_string()));
+        assert_eq!(head.first_prompt, Some("hello".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

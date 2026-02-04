@@ -43,9 +43,11 @@ just install  # Build and install to ~/.local/bin (macOS signing handled automat
 cc-sessions                      # Interactive picker (default)
 cc-sessions --fork               # Fork mode - creates new session ID instead of resuming
 cc-sessions --project dotfiles   # Filter by project name (case-insensitive)
+cc-sessions --debug              # Show session ID prefixes (works in interactive mode too)
 cc-sessions --list               # List mode (non-interactive table)
 cc-sessions --list --count 30    # List 30 sessions
 cc-sessions --list --debug       # List with session IDs and stats
+cc-sessions --list --include-forks  # List mode including forked sessions
 ```
 
 ### Interactive mode (default)
@@ -54,8 +56,11 @@ cc-sessions --list --debug       # List with session IDs and stats
 - **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
 - **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
 - **Enter** to resume session in the original project directory
-- **esc** clears search filter, or exits if no filter active
+- **esc** goes back to root view, or exits if already at root
+- **▶** indicates sessions with forks — press **→** to drill into that session's subtree
+- **←** goes back to the previous view
 - Use `--fork` to fork instead of resume (creates new session ID)
+- Use `--debug` to show session ID prefixes (useful for debugging)
 
 ### List mode (`--list`)
 
@@ -70,6 +75,12 @@ CREAT  MOD    PROJECT          SUMMARY
 ```
 
 Sessions renamed with `/rename` in Claude Code show a `★` prefix.
+
+### Forked sessions
+
+Claude Code forks create a separate `.jsonl` file that references the parent via
+`forkedFrom.sessionId`. cc-sessions detects this relationship and can display
+forks nested under their parent sessions in interactive mode.
 
 ## How it works
 

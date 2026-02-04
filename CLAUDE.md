@@ -98,6 +98,7 @@ This filters out:
 |-------|--------|----------|
 | `project_path` | `cwd` field | File head |
 | `first_message` | First `user` entry | File head |
+| `forked_from` | `forkedFrom.sessionId` field | File head |
 | `summary` | `summary` type entry | File tail (16KB) |
 | `name` (customTitle) | `custom-title` entry | Grep entire file |
 | `created` | Filesystem | `metadata.created()` |
@@ -111,16 +112,80 @@ This filters out:
 - Displayed with `★` prefix: `★ name - summary`
 - Indicates user-marked important sessions
 
+### Forked Sessions
+
+Sessions can be forked via `/fork` command or `claude --fork-session`. A fork creates a **new session file** that copies the conversation history up to a point, allowing the user to explore an alternate path.
+
+#### Fork Relationship Structure
+
+```
+Parent Session (511623e7-...)
+  ├── Fork A (c33eb693-...)    # forkedFrom: 511623e7-...
+  └── Fork B (cc0f0043-...)    # forkedFrom: 511623e7-...
+```
+
+Each entry in a forked session contains a `forkedFrom` field:
+
+```json
+{
+  "type": "user",
+  "message": {...},
+  "sessionId": "cc0f0043-...",
+  "forkedFrom": {
+    "sessionId": "511623e7-...",      // Parent session ID
+    "messageUuid": "23ede6bc-..."     // Corresponding message in parent
+  }
+}
+```
+
+#### Key Points
+
+| Aspect | Behavior |
+|--------|----------|
+| Storage | Fork is a separate `.jsonl` file with full conversation copy |
+| Relationship | `forkedFrom.sessionId` on entries links to parent |
+| Index | `sessions-index.json` does NOT store fork relationships |
+| customTitle | Claude Code auto-appends "(Fork)" to forked session titles |
+| Detection | Must extract `forkedFrom` from JSONL file head (first ~50 lines) |
+
+#### Extraction Strategy
+
+1. Read first ~50 lines of each session file
+2. Look for `forkedFrom.sessionId` field on any entry
+3. Build parent→children map after loading all sessions
+4. A session without `forkedFrom` is a "root" session
+5. Multiple forks can share the same parent (siblings)
+
 ### Interactive Mode
 
 Uses embedded [skim](https://github.com/lotabout/skim) crate (no external fzf dependency):
 
 1. Build `SkimOptions` with preview command pointing to self
 2. Send `SessionItem`s through crossbeam channel
-3. Preview calls `cc-sessions --preview <filepath>` to format transcript
+3. Preview generates content directly (no subprocess)
 4. On selection, spawns `zsh -c "cd <project> && claude -r <session-id>"`
 
-The `--preview` flag is internal: it reads a `.jsonl` file and outputs color-coded transcript lines.
+#### Fork Navigation (Subtree Drill-down)
+
+Interactive mode uses a **navigation stack** for exploring fork trees:
+
+- **Root view**: Shows only root sessions (those without a parent in the session set)
+- **`▶` indicator**: Session has child forks
+- **→ (right arrow)**: Drill into selected session's subtree (push to stack)
+- **← (left arrow)**: Go back to previous view (pop from stack)
+- **Esc**: Return to root view (clear entire stack)
+
+```
+Root View                    After → on e5e2d           After → on 398eb
+─────────────────────        ─────────────────────      ─────────────────────
+▶ e5e2d  (parent)            ▶ e5e2d  (focused)         ▶ 398eb  (focused)
+  f1064  (no forks)          ▶ 398eb  (child)             5b88a  (grandchild)
+  ...                          c0ff2  (child)             c0ff2  (grandchild)
+```
+
+#### Debug Mode
+
+`--debug` flag adds a 5-character session ID prefix column for debugging navigation.
 
 ## Dependencies
 
