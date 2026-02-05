@@ -171,17 +171,44 @@ Interactive mode uses a **navigation stack** for exploring fork trees:
 
 - **Root view**: Shows only root sessions (those without a parent in the session set)
 - **`▶` indicator**: Session has child forks
-- **→ (right arrow)**: Drill into selected session's subtree (push to stack)
+- **`▷` indicator**: Focused parent (distinguishes from children with forks)
+- **→ (right arrow)**: Drill into selected session, showing parent + direct children only
 - **← (left arrow)**: Go back to previous view (pop from stack)
 - **Esc**: Return to root view (clear entire stack)
 
 ```
 Root View                    After → on e5e2d           After → on 398eb
 ─────────────────────        ─────────────────────      ─────────────────────
-▶ e5e2d  (parent)            ▶ e5e2d  (focused)         ▶ 398eb  (focused)
-  f1064  (no forks)          ▶ 398eb  (child)             5b88a  (grandchild)
-  ...                          c0ff2  (child)             c0ff2  (grandchild)
+▶ e5e2d  (parent)            ▷ e5e2d  (focused)         ▷ 398eb  (focused)
+  f1064  (no forks)          ▶ 398eb  (child w/forks)     5b88a  (direct child)
+  ...                          c0ff2  (child)             c0ff2  (direct child)
 ```
+
+Note: Each drill-down shows only **direct children**, not all descendants. To see grandchildren, drill into the child session.
+
+#### Column Layout
+
+Interactive mode displays a header with column legend:
+
+```
+  CRE  MOD  MSG SOURCE PROJECT      SUMMARY
+```
+
+| Column | Description |
+|--------|-------------|
+| CRE | Created timestamp (relative) |
+| MOD | Modified timestamp (relative) |
+| MSG | Turn count (user messages, excludes system content) |
+| SOURCE | Session source (local, remote) |
+| PROJECT | Project directory name |
+| SUMMARY | AI-generated summary or custom title |
+
+#### Turn Counting
+
+The MSG column shows actual user turns, filtering out system content:
+- Excludes `<command-...>` tags (hook output)
+- Excludes `[...]` bracketed content (local tool output)
+- Excludes `/...` commands (slash commands)
 
 #### Debug Mode
 

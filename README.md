@@ -57,21 +57,24 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 - **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
 - **Enter** to resume session in the original project directory
 - **esc** goes back to root view, or exits if already at root
-- **▶** indicates sessions with forks — press **→** to drill into that session's subtree
+- **▶** indicates sessions with forks — press **→** to drill into direct children
+- **▷** indicates the focused parent when viewing a subtree
 - **←** goes back to the previous view
 - Use `--fork` to fork instead of resume (creates new session ID)
 - Use `--debug` to show session ID prefixes (useful for debugging)
 
+Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, source, project name, summary)
+
 ### List mode (`--list`)
 
-Shows sessions as a table with relative timestamps and AI-generated summaries:
+Shows sessions as a table with relative timestamps, message counts, and AI-generated summaries:
 
 ```
-CREAT  MOD    PROJECT          SUMMARY
-──────────────────────────────────────────────────────────────────────────────────────────
-1h     1h     dotfiles         Shell alias structure refactoring
-2d     3h     bike-power       Bike Power App: Build 10, Landscape Layout
-4h     3h     cc-session       ★ my-session - Claude Code session improvements
+CRE  MOD  MSG SOURCE PROJECT      SUMMARY
+───────────────────────────────────────────────────────────────────────────────
+1h   1h    12 local  dotfiles     Shell alias structure refactoring
+2d   3h    45 local  bike-power   Bike Power App: Build 10, Landscape
+4h   3h     8 local  cc-session   ★ my-session - Claude Code session...
 ```
 
 Sessions renamed with `/rename` in Claude Code show a `★` prefix.
