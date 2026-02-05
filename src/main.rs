@@ -807,33 +807,42 @@ fn build_fork_tree<'a>(
 /// Build header showing current navigation state
 fn build_subtree_header(
     search_pattern: &Option<String>,
+    search_count: Option<usize>,
     fork: bool,
     focus: Option<&String>,
     session_by_id: &std::collections::HashMap<&str, &Session>,
     debug: bool,
 ) -> String {
-    let nav_hint = if focus.is_some() {
-        "← back"
+    // When searching, show esc to clear; otherwise show navigation hints
+    let (nav_hint, focus_info) = if search_pattern.is_some() {
+        ("esc to clear".to_string(), String::new())
     } else {
-        "→ into forks"
+        let hint = if focus.is_some() {
+            "← back"
+        } else {
+            "→ into forks"
+        };
+        let info = focus
+            .and_then(|id| session_by_id.get(id.as_str()))
+            .map(|s| {
+                let desc = format_session_desc(s, 30);
+                format!(" [{}]", desc)
+            })
+            .unwrap_or_default();
+        (hint.to_string(), info)
     };
 
-    let focus_info = focus
-        .and_then(|id| session_by_id.get(id.as_str()))
-        .map(|s| {
-            let desc = format_session_desc(s, 30);
-            format!(" [{}]", desc)
-        })
-        .unwrap_or_default();
-
-    let status_line = match (search_pattern, fork) {
-        (Some(pat), true) => format!(
-            "FORK │ search: \"{}\" │ {} │ {}",
-            pat, nav_hint, focus_info
-        ),
-        (Some(pat), false) => format!("search: \"{}\" │ {} │ {}", pat, nav_hint, focus_info),
-        (None, true) => format!("FORK mode │ {}{}", nav_hint, focus_info),
-        (None, false) => format!("Select session │ {}{}", nav_hint, focus_info),
+    let status_line = match (search_pattern, search_count, fork) {
+        (Some(pat), Some(count), true) => {
+            format!("FORK │ search: \"{}\" ({} matches) │ {}", pat, count, nav_hint)
+        }
+        (Some(pat), Some(count), false) => {
+            format!("search: \"{}\" ({} matches) │ {}", pat, count, nav_hint)
+        }
+        (Some(pat), None, true) => format!("FORK │ search: \"{}\" │ {}", pat, nav_hint),
+        (Some(pat), None, false) => format!("search: \"{}\" │ {}", pat, nav_hint),
+        (None, _, true) => format!("FORK mode │ {}{}", nav_hint, focus_info),
+        (None, _, false) => format!("Select session │ {}{}", nav_hint, focus_info),
     };
 
     let legend = build_column_legend(debug);
@@ -890,13 +899,21 @@ fn interactive_mode(
 
     // Navigation state - stack tracks drill-down history (empty = root view)
     let mut search_pattern: Option<String> = None;
+    let mut search_results: Option<std::collections::HashSet<String>> = None;
     let mut focus_stack: Vec<String> = Vec::new();
 
     loop {
-        // Build visible sessions based on focus
+        // Build visible sessions based on search results or focus
+        // Search results take priority - they replace the view temporarily
         let focus = focus_stack.last();
-        let visible_sessions: Vec<&Session> = if let Some(focus_id) = focus {
-            // Show focused session + direct children only (not all descendants)
+        let visible_sessions: Vec<&Session> = if let Some(ref matched_ids) = search_results {
+            // Search mode: show only sessions that matched the search
+            sessions
+                .iter()
+                .filter(|s| matched_ids.contains(&s.id))
+                .collect()
+        } else if let Some(focus_id) = focus {
+            // Subtree mode: show focused session + direct children only
             let mut result = Vec::new();
             if let Some(session) = session_by_id.get(focus_id.as_str()) {
                 result.push(*session);
@@ -926,7 +943,9 @@ fn interactive_mode(
             session_info.insert(session.id.clone(), (has_children, parent_id));
         }
 
-        let header = build_subtree_header(&search_pattern, fork, focus, &session_by_id, debug);
+        let search_count = search_results.as_ref().map(|r| r.len());
+        let header =
+            build_subtree_header(&search_pattern, search_count, fork, focus, &session_by_id, debug);
 
         let options = SkimOptionsBuilder::default()
             .height(Some("100%"))
@@ -973,13 +992,14 @@ fn interactive_mode(
 
         match output {
             Some(out) if out.is_abort => {
-                // Esc: if in subtree, go to root; if searching, clear; otherwise exit
-                if !focus_stack.is_empty() {
-                    focus_stack.clear();
+                // Esc: if searching, clear search; if in subtree, go to root; otherwise exit
+                if search_results.is_some() {
+                    search_results = None;
+                    search_pattern = None;
                     continue;
                 }
-                if search_pattern.is_some() {
-                    search_pattern = None;
+                if !focus_stack.is_empty() {
+                    focus_stack.clear();
                     continue;
                 }
                 return Ok(());
@@ -987,15 +1007,16 @@ fn interactive_mode(
             Some(out) => {
                 let query = out.query.trim();
 
-                // ctrl+s triggers transcript search
+                // ctrl+s triggers transcript search - replaces view with matching sessions
                 if out.final_key == Key::Ctrl('s') {
                     if query.is_empty() {
                         continue;
                     }
                     match claude_code::search_all_sessions(config, query, None) {
-                        Ok(_matched) => {
-                            // For now, just set search pattern for preview highlighting
-                            // TODO: filter to matched sessions
+                        Ok(matched) => {
+                            let matched_ids: std::collections::HashSet<String> =
+                                matched.iter().map(|s| s.id.clone()).collect();
+                            search_results = Some(matched_ids);
                             search_pattern = Some(query.to_string());
                         }
                         Err(e) => {
@@ -1371,7 +1392,7 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
-        let header = build_subtree_header(&None, false, None, &session_by_id, false);
+        let header = build_subtree_header(&None, None, false, None, &session_by_id, false);
         assert!(header.contains("Select session"));
         assert!(header.contains("→ into forks"));
         assert!(header.contains("CRE")); // Legend line
@@ -1382,7 +1403,7 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
-        let header = build_subtree_header(&None, true, None, &session_by_id, false);
+        let header = build_subtree_header(&None, None, true, None, &session_by_id, false);
         assert!(header.contains("FORK mode"));
     }
 
@@ -1391,9 +1412,12 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
+        // Search with match count
         let header =
-            build_subtree_header(&Some("api".to_string()), false, None, &session_by_id, false);
+            build_subtree_header(&Some("api".to_string()), Some(5), false, None, &session_by_id, false);
         assert!(header.contains("search: \"api\""));
+        assert!(header.contains("(5 matches)"));
+        assert!(header.contains("esc to clear"));
     }
 
     #[test]
@@ -1404,7 +1428,7 @@ mod tests {
         session_by_id.insert("focused", &session);
 
         let focus = "focused".to_string();
-        let header = build_subtree_header(&None, false, Some(&focus), &session_by_id, false);
+        let header = build_subtree_header(&None, None, false, Some(&focus), &session_by_id, false);
         assert!(header.contains("← back"));
         assert!(!header.contains("→ into forks"));
     }

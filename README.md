@@ -54,9 +54,9 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 
 - **Fuzzy search** through project names and summaries
 - **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
-- **ctrl+s** for full-text transcript search (greps all messages, shows matches with context)
+- **ctrl+s** for full-text transcript search — replaces view with matching sessions, esc clears
 - **Enter** to resume session in the original project directory
-- **esc** goes back to root view, or exits if already at root
+- **esc** clears search first, then goes to root view, then exits
 - **▶** indicates sessions with forks — press **→** to drill into direct children
 - **▷** indicates the focused parent when viewing a subtree
 - **←** goes back to the previous view

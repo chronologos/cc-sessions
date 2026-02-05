@@ -518,12 +518,15 @@ pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Sess
 }
 
 /// Search sessions with a specific source tag.
+///
+/// Only searches within user/assistant message content (not tool outputs,
+/// system messages, or JSON structure). This matches what the preview shows.
 pub fn search_sessions_with_source(
     projects_dir: &PathBuf,
     pattern: &str,
     source: SessionSource,
 ) -> Result<Vec<Session>> {
-    let matcher = RegexMatcher::new_line_matcher(pattern).context("Invalid search pattern")?;
+    let pattern_lower = pattern.to_lowercase();
 
     // Find all .jsonl files with valid UUID filenames
     let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
@@ -533,21 +536,10 @@ pub fn search_sessions_with_source(
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // Search files in parallel
+    // Search files in parallel - only match within message content
     let matching_files: Vec<PathBuf> = jsonl_files
         .par_iter()
-        .filter(|path| {
-            let mut found = false;
-            let _ = Searcher::new().search_path(
-                &matcher,
-                path,
-                UTF8(|_, _| {
-                    found = true;
-                    Ok(false) // Stop after first match
-                }),
-            );
-            found
-        })
+        .filter(|path| session_has_matching_message(path, &pattern_lower))
         .cloned()
         .collect();
 
@@ -566,6 +558,71 @@ pub fn search_sessions_with_source(
 
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
+}
+
+/// Check if a session file contains the pattern in user/assistant message content.
+///
+/// This ensures search results match what the preview will show.
+fn session_has_matching_message(filepath: &PathBuf, pattern_lower: &str) -> bool {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = match File::open(filepath) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().map_while(Result::ok) {
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only check user/assistant message entries
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
+        if !matches!(entry_type, Some("user") | Some("assistant")) {
+            continue;
+        }
+
+        // Extract message content
+        if let Some(text) = extract_message_text_for_search(&entry) {
+            if text.to_lowercase().contains(pattern_lower) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Extract text from message content for search purposes.
+fn extract_message_text_for_search(entry: &serde_json::Value) -> Option<String> {
+    let content = entry.get("message")?.get("content")?;
+
+    // Content can be a string or array of content blocks
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+
+    // For arrays, collect all text blocks
+    if let Some(arr) = content.as_array() {
+        let texts: Vec<String> = arr
+            .iter()
+            .filter_map(|c| {
+                if c.get("type")?.as_str()? == "text" {
+                    Some(c.get("text")?.as_str()?.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !texts.is_empty() {
+            return Some(texts.join(" "));
+        }
+    }
+
+    None
 }
 
 // =============================================================================

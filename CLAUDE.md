@@ -186,6 +186,33 @@ Root View                    After → on e5e2d           After → on 398eb
 
 Note: Each drill-down shows only **direct children**, not all descendants. To see grandchildren, drill into the child session.
 
+#### Transcript Search (Ctrl+S)
+
+Ctrl+S performs full-text search across all session transcripts and **replaces the view** with matching results:
+
+- **Search**: Type query in filter prompt, press Ctrl+S to search
+- **Results**: List shows only sessions containing the search pattern
+- **Preview**: Matching lines highlighted in preview pane
+- **Esc**: Clears search, returns to previous view (root or subtree)
+
+**What gets searched**: Only user/assistant message content. Tool outputs, system messages, and JSON metadata are excluded. This ensures search results match what the preview shows.
+
+**Design choice**: Search replaces the view temporarily rather than filtering within the current subtree. This ensures you can find any session regardless of navigation state. The search results persist until explicitly cleared with Esc.
+
+```
+Normal View                  After Ctrl+S "api"
+─────────────────────        ─────────────────────
+▶ session-a                  search: "api" (3 matches) │ esc to clear
+  session-b                  session-b    (has "api")
+▶ session-c                  session-d    (has "api")
+  session-d                  session-f    (has "api")
+```
+
+Navigation while searching:
+- Subtree navigation (← →) is disabled during search mode
+- Enter still selects the session to resume
+- Esc clears search before clearing subtree focus
+
 #### Column Layout
 
 Interactive mode displays a header with column legend:
