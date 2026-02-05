@@ -314,7 +314,7 @@ fn format_session_desc(session: &Session, max_chars: usize) -> String {
     }
 }
 
-fn filter_forks_for_list<'a>(sessions: &'a [Session], include_forks: bool) -> Vec<&'a Session> {
+fn filter_forks_for_list(sessions: &[Session], include_forks: bool) -> Vec<&Session> {
     if include_forks {
         return sessions.iter().collect();
     }
@@ -769,20 +769,6 @@ fn build_fork_tree<'a>(
     }
 
     children_map
-}
-
-/// Collect a session and all its descendants into a vec
-fn collect_subtree<'a>(
-    session: &'a Session,
-    children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
-    result: &mut Vec<&'a Session>,
-) {
-    result.push(session);
-    if let Some(children) = children_map.get(&session.id) {
-        for child in children {
-            collect_subtree(child, children_map, result);
-        }
-    }
 }
 
 /// Build header showing current navigation state
@@ -1251,6 +1237,24 @@ mod tests {
         assert!(!children_map.contains_key("grandchild"));
     }
 
+    // =========================================================================
+    // Subtree collection (test-only helper for future use)
+    // =========================================================================
+
+    /// Collect a session and all its descendants into a vec (test helper)
+    fn collect_subtree<'a>(
+        session: &'a Session,
+        children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
+        result: &mut Vec<&'a Session>,
+    ) {
+        result.push(session);
+        if let Some(children) = children_map.get(&session.id) {
+            for child in children {
+                collect_subtree(child, children_map, result);
+            }
+        }
+    }
+
     #[test]
     fn collect_subtree_includes_all_descendants() {
         // root -> child1, child2
@@ -1301,5 +1305,106 @@ mod tests {
         assert!(ids.contains(&"grandchild"));
         assert!(!ids.contains(&"root"));
         assert!(!ids.contains(&"child2"));
+    }
+
+    // =========================================================================
+    // Column legend and header formatting
+    // =========================================================================
+
+    #[test]
+    fn build_column_legend_without_debug() {
+        let legend = build_column_legend(false);
+        assert_eq!(legend, "  CRE  MOD  MSG SOURCE PROJECT      SUMMARY");
+        assert!(!legend.contains("ID"));
+    }
+
+    #[test]
+    fn build_column_legend_with_debug() {
+        let legend = build_column_legend(true);
+        assert!(legend.contains("ID"));
+        assert!(legend.contains("CRE"));
+        assert!(legend.contains("MSG"));
+    }
+
+    #[test]
+    fn build_subtree_header_root_view() {
+        use std::collections::HashMap;
+        let session_by_id: HashMap<&str, &Session> = HashMap::new();
+
+        let header = build_subtree_header(&None, false, None, &session_by_id, false);
+        assert!(header.contains("Select session"));
+        assert!(header.contains("→ into forks"));
+        assert!(header.contains("CRE")); // Legend line
+    }
+
+    #[test]
+    fn build_subtree_header_fork_mode() {
+        use std::collections::HashMap;
+        let session_by_id: HashMap<&str, &Session> = HashMap::new();
+
+        let header = build_subtree_header(&None, true, None, &session_by_id, false);
+        assert!(header.contains("FORK mode"));
+    }
+
+    #[test]
+    fn build_subtree_header_with_search() {
+        use std::collections::HashMap;
+        let session_by_id: HashMap<&str, &Session> = HashMap::new();
+
+        let header =
+            build_subtree_header(&Some("api".to_string()), false, None, &session_by_id, false);
+        assert!(header.contains("search: \"api\""));
+    }
+
+    #[test]
+    fn build_subtree_header_focused_shows_back() {
+        use std::collections::HashMap;
+        let session = test_session("focused");
+        let mut session_by_id: HashMap<&str, &Session> = HashMap::new();
+        session_by_id.insert("focused", &session);
+
+        let focus = "focused".to_string();
+        let header = build_subtree_header(&None, false, Some(&focus), &session_by_id, false);
+        assert!(header.contains("← back"));
+        assert!(!header.contains("→ into forks"));
+    }
+
+    // =========================================================================
+    // Session row formatting
+    // =========================================================================
+
+    #[test]
+    fn format_session_row_simple_basic() {
+        let session = test_session("test-id");
+        let row = format_session_row_simple("  ", &session, false);
+
+        // Should contain project name and source
+        assert!(row.contains("test-proj"));
+        assert!(row.contains("local"));
+        // Should NOT start with ID prefix when debug=false (starts with "  " prefix)
+        assert!(row.starts_with("  "));
+        // ID "test-id" first 5 chars is "test-" which should NOT appear at start
+        assert!(!row.starts_with("  test-"));
+    }
+
+    #[test]
+    fn format_session_row_simple_with_debug() {
+        let session = test_session("abcdef-1234");
+        let row = format_session_row_simple("▶ ", &session, true);
+
+        // Should contain first 5 chars of ID
+        assert!(row.contains("abcde"));
+        // Should contain the prefix
+        assert!(row.starts_with("▶ "));
+    }
+
+    #[test]
+    fn format_session_row_simple_shows_turn_count() {
+        let mut session = test_session("test");
+        session.turn_count = 42;
+        let row = format_session_row_simple("  ", &session, false);
+
+        // Turn count should be right-aligned in 3 chars
+        assert!(row.contains(" 42 "));
     }
 }

@@ -983,4 +983,91 @@ mod tests {
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
+
+    // =========================================================================
+    // Turn counting - only real user messages, not system content
+    // =========================================================================
+
+    #[test]
+    fn count_turns_real_user_messages() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-turns-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"Hello, how are you?"}}
+{"type":"assistant","message":{"role":"assistant","content":"I'm good!"}}
+{"type":"user","message":{"role":"user","content":"What is Rust?"}}
+{"type":"assistant","message":{"role":"assistant","content":"A programming language."}}"#,
+        )
+        .unwrap();
+
+        let count = count_turns(&session_path);
+        assert_eq!(count, 2); // Two real user messages
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn count_turns_excludes_system_content() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-turns-sys-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"<command-message>init</command-message>"}}
+{"type":"user","message":{"role":"user","content":"Real message here"}}
+{"type":"user","message":{"role":"user","content":"<local-command-stdout>output</local-command-stdout>"}}
+{"type":"user","message":{"role":"user","content":"/help"}}
+{"type":"user","message":{"role":"user","content":"[some bracketed thing]"}}
+{"type":"user","message":{"role":"user","content":"Another real message"}}"#,
+        )
+        .unwrap();
+
+        let count = count_turns(&session_path);
+        assert_eq!(count, 2); // Only "Real message here" and "Another real message"
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn count_turns_handles_content_blocks() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-turns-blocks-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        // Content as array of blocks (common format)
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello from blocks"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/init</command-name>"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Real question?"}]}}"#,
+        )
+        .unwrap();
+
+        let count = count_turns(&session_path);
+        assert_eq!(count, 2); // "Hello from blocks" and "Real question?"
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn count_turns_empty_file() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-turns-empty-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(&session_path, "").unwrap();
+
+        let count = count_turns(&session_path);
+        assert_eq!(count, 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
 }
