@@ -791,6 +791,7 @@ fn build_subtree_header(
     fork: bool,
     focus: Option<&String>,
     session_by_id: &std::collections::HashMap<&str, &Session>,
+    debug: bool,
 ) -> String {
     let nav_hint = if focus.is_some() {
         "← back"
@@ -806,7 +807,7 @@ fn build_subtree_header(
         })
         .unwrap_or_default();
 
-    match (search_pattern, fork) {
+    let status_line = match (search_pattern, fork) {
         (Some(pat), true) => format!(
             "FORK │ search: \"{}\" │ {} │ {}",
             pat, nav_hint, focus_info
@@ -814,7 +815,10 @@ fn build_subtree_header(
         (Some(pat), false) => format!("search: \"{}\" │ {} │ {}", pat, nav_hint, focus_info),
         (None, true) => format!("FORK mode │ {}{}", nav_hint, focus_info),
         (None, false) => format!("Select session │ {}{}", nav_hint, focus_info),
-    }
+    };
+
+    let legend = build_column_legend(debug);
+    format!("{}\n{}", status_line, legend)
 }
 
 /// Simple session row format (no tree glyphs)
@@ -823,20 +827,31 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
     let modified = format_time_relative(session.modified);
     let source = session.source.display_name();
     let id_prefix = if debug {
-        format!("{:<6} ", &session.id[..5.min(session.id.len())])
+        format!("{:<6}", &session.id[..5.min(session.id.len())])
     } else {
         String::new()
     };
+    let msgs = format!("{:>3}", session.turn_count);
 
     format!(
-        "{}{}{:<6} {:<6} {:<8} {:<12} {}",
+        "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
         prefix,
         id_prefix,
         created,
         modified,
+        msgs,
         source,
         session.project,
         format_session_desc(session, 40),
+    )
+}
+
+/// Build column legend for interactive mode
+fn build_column_legend(debug: bool) -> String {
+    let id_col = if debug { "ID    " } else { "" };
+    format!(
+        "  {}CRE  MOD  MSG SOURCE PROJECT      SUMMARY",
+        id_col
     )
 }
 
@@ -892,7 +907,7 @@ fn interactive_mode(
             session_info.insert(session.id.clone(), (has_children, parent_id));
         }
 
-        let header = build_subtree_header(&search_pattern, fork, focus, &session_by_id);
+        let header = build_subtree_header(&search_pattern, fork, focus, &session_by_id, debug);
 
         let options = SkimOptionsBuilder::default()
             .height(Some("100%"))

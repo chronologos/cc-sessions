@@ -362,24 +362,66 @@ fn read_file_tail(filepath: &Path) -> (Option<String>, Option<String>) {
     (summary, custom_title)
 }
 
-/// Count conversation turns (user messages) in a session file.
+/// Count conversation turns (real user messages) in a session file.
 ///
-/// Uses grep for efficiency - counts lines matching `"type":"user"`.
+/// Only counts entries where:
+/// - type == "user"
+/// - message.content exists and is not system content (starts with <, [, or /)
 fn count_turns(filepath: &Path) -> usize {
-    let matcher = match RegexMatcher::new_line_matcher(r#""type"\s*:\s*"user""#) {
-        Ok(m) => m,
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let file = match File::open(filepath) {
+        Ok(f) => f,
         Err(_) => return 0,
     };
 
+    let reader = BufReader::new(file);
     let mut count = 0;
-    let _ = Searcher::new().search_path(
-        &matcher,
-        filepath,
-        UTF8(|_, _| {
-            count += 1;
-            Ok(true) // Continue to count all matches
-        }),
-    );
+
+    for line in reader.lines().map_while(Result::ok) {
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only count type == "user" entries
+        if entry.get("type").and_then(|v| v.as_str()) != Some("user") {
+            continue;
+        }
+
+        // Extract message content
+        let content = match entry.get("message").and_then(|m| m.get("content")) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Get text from content (string or array of blocks)
+        let text = if let Some(s) = content.as_str() {
+            s.to_string()
+        } else if let Some(arr) = content.as_array() {
+            arr.iter()
+                .find_map(|c| {
+                    if c.get("type")?.as_str()? == "text" {
+                        Some(c.get("text")?.as_str()?.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            continue;
+        };
+
+        // Skip system content (starts with <, [, or /)
+        if text.is_empty() || text.starts_with('<') || text.starts_with('[') || text.starts_with('/')
+        {
+            continue;
+        }
+
+        count += 1;
+    }
+
     count
 }
 
