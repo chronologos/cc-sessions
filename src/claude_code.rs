@@ -43,9 +43,8 @@ pub fn get_claude_projects_dir() -> Result<PathBuf> {
 /// Check if a source should be included based on the filter.
 fn should_include_source(remote_filter: Option<&str>, source_name: &str) -> bool {
     match remote_filter {
-        None => true, // No filter = include everything
-        Some("local") => source_name == "local",
-        Some(filter) => source_name == filter || source_name == "local" && filter == "local",
+        None => true,
+        Some(filter) => source_name == filter,
     }
 }
 
@@ -467,6 +466,7 @@ fn read_summary_from_tail(filepath: &Path) -> Option<String> {
 ///
 /// CustomTitle can appear anywhere in the file (when user runs /rename),
 /// so we use grep to efficiently locate it rather than reading the whole file.
+/// Returns the LAST match since users may rename multiple times.
 fn find_custom_title(filepath: &Path) -> Option<String> {
     // Use grep to find custom-title lines efficiently
     let matcher = RegexMatcher::new_line_matcher(r#""type"\s*:\s*"custom-title""#).ok()?;
@@ -477,7 +477,7 @@ fn find_custom_title(filepath: &Path) -> Option<String> {
         filepath,
         UTF8(|_, line| {
             found_line = Some(line.to_string());
-            Ok(false) // Stop after first match (there should only be one)
+            Ok(true) // Continue to find the last match (most recent rename)
         }),
     );
 

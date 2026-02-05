@@ -8,7 +8,8 @@
       "Bash(./target/release/cc-session:*)",
       "Bash(just install:*)",
       "Bash(eza:*)",
-      "Bash(~/.local/bin/cc-sessions:*)"
+      "Bash(~/.local/bin/cc-sessions:*)",
+      "Bash(cargo clippy:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

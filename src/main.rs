@@ -266,8 +266,12 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
 
 fn format_time_relative(time: SystemTime) -> String {
     let now = SystemTime::now();
-    let duration = now.duration_since(time).unwrap_or_default();
-    let secs = duration.as_secs();
+
+    // Handle future timestamps (clock skew, filesystem issues)
+    let secs = match now.duration_since(time) {
+        Ok(d) => d.as_secs(),
+        Err(_) => return "?".to_string(), // Future timestamp
+    };
 
     if secs < 60 {
         "now".to_string()
@@ -649,25 +653,46 @@ fn format_matching_message(msg: &Message, pattern: &str) -> String {
     output
 }
 
-/// Highlight matching text with bold/inverse
+/// Highlight matching text with bold/inverse (Unicode-safe)
+///
+/// Uses character-based matching to handle cases where lowercasing
+/// changes byte length (e.g., ß → ss, İ → i̇).
 fn highlight_match(text: &str, pattern: &str) -> String {
-    let text_lower = text.to_lowercase();
-    let pattern_lower = pattern.to_lowercase();
-
-    let mut result = String::new();
-    let mut last_end = 0;
-
-    for (start, _) in text_lower.match_indices(&pattern_lower) {
-        // Add text before match
-        result.push_str(&text[last_end..start]);
-        // Add highlighted match (using original case from text)
-        result.push_str(colors::BOLD_INVERSE);
-        result.push_str(&text[start..start + pattern.len()]);
-        result.push_str(colors::RESET);
-        last_end = start + pattern.len();
+    if pattern.is_empty() {
+        return text.to_string();
     }
 
-    // Add remaining text
+    let pattern_lower = pattern.to_lowercase();
+    let pattern_char_count = pattern.chars().count();
+    let mut result = String::new();
+    let mut last_end = 0;
+    let mut i = 0;
+
+    while i < text.len() {
+        let remaining = &text[i..];
+        let remaining_lower = remaining.to_lowercase();
+
+        if remaining_lower.starts_with(&pattern_lower) {
+            // Found match - count characters to get correct byte length in original
+            let match_byte_len = remaining
+                .char_indices()
+                .nth(pattern_char_count)
+                .map(|(idx, _)| idx)
+                .unwrap_or(remaining.len());
+
+            result.push_str(&text[last_end..i]);
+            result.push_str(colors::BOLD_INVERSE);
+            result.push_str(&text[i..i + match_byte_len]);
+            result.push_str(colors::RESET);
+
+            last_end = i + match_byte_len;
+            i = last_end;
+        } else {
+            // Advance to next character boundary
+            i += remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+
     result.push_str(&text[last_end..]);
     result
 }
@@ -675,6 +700,12 @@ fn highlight_match(text: &str, pattern: &str) -> String {
 // =============================================================================
 // Session Resume
 // =============================================================================
+
+/// Escape a string for safe inclusion in single-quoted shell argument.
+/// Handles single quotes by ending the quote, adding escaped quote, reopening.
+fn shell_escape(s: &str) -> String {
+    s.replace("'", "'\\''")
+}
 
 /// Resume or fork a session, handling both local and remote sessions.
 fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> Result<()> {
@@ -691,10 +722,12 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
         anyhow::bail!("Cannot resume: no project path");
     }
 
-    // Build the claude command (same for local and remote)
+    // Build the claude command with properly escaped arguments
     let claude_cmd = format!(
         "cd '{}' && claude -r '{}'{}",
-        project_path, session.id, fork_flag
+        shell_escape(project_path),
+        shell_escape(&session.id),
+        fork_flag
     );
 
     let status = match &session.source {
@@ -1165,6 +1198,13 @@ mod tests {
         assert_eq!(format_time_relative(time), "3w");
     }
 
+    #[test]
+    fn format_time_relative_future() {
+        use std::time::Duration;
+        let time = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(format_time_relative(time), "?");
+    }
+
     // =========================================================================
     // Fork list and tree view
     // =========================================================================
@@ -1406,5 +1446,83 @@ mod tests {
 
         // Turn count should be right-aligned in 3 chars
         assert!(row.contains(" 42 "));
+    }
+
+    // =========================================================================
+    // Shell escaping (security)
+    // =========================================================================
+
+    #[test]
+    fn shell_escape_no_quotes() {
+        assert_eq!(shell_escape("hello"), "hello");
+        assert_eq!(shell_escape("/path/to/project"), "/path/to/project");
+    }
+
+    #[test]
+    fn shell_escape_single_quotes() {
+        // Single quote becomes: end quote, escaped quote, start quote
+        assert_eq!(shell_escape("it's"), "it'\\''s");
+        assert_eq!(shell_escape("'quoted'"), "'\\''quoted'\\''");
+    }
+
+    #[test]
+    fn shell_escape_multiple_quotes() {
+        assert_eq!(shell_escape("a'b'c"), "a'\\''b'\\''c");
+    }
+
+    #[test]
+    fn shell_escape_preserves_other_chars() {
+        // Double quotes, spaces, etc. are fine inside single quotes
+        assert_eq!(shell_escape("hello world"), "hello world");
+        assert_eq!(shell_escape("\"quoted\""), "\"quoted\"");
+        assert_eq!(shell_escape("$HOME"), "$HOME");
+    }
+
+    // =========================================================================
+    // Highlight matching (Unicode-safe)
+    // =========================================================================
+
+    #[test]
+    fn highlight_match_basic() {
+        let result = highlight_match("hello world", "world");
+        assert!(result.contains(colors::BOLD_INVERSE));
+        assert!(result.contains("world"));
+        assert!(result.contains(colors::RESET));
+    }
+
+    #[test]
+    fn highlight_match_case_insensitive() {
+        let result = highlight_match("Hello World", "world");
+        // Should highlight "World" (preserving original case)
+        assert!(result.contains("World"));
+        assert!(result.contains(colors::BOLD_INVERSE));
+    }
+
+    #[test]
+    fn highlight_match_empty_pattern() {
+        assert_eq!(highlight_match("hello", ""), "hello");
+    }
+
+    #[test]
+    fn highlight_match_no_match() {
+        let result = highlight_match("hello", "xyz");
+        assert!(!result.contains(colors::BOLD_INVERSE));
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn highlight_match_multibyte_chars() {
+        // Test with emoji and Unicode - should not panic
+        let result = highlight_match("hello 🌍 world", "world");
+        assert!(result.contains(colors::BOLD_INVERSE));
+    }
+
+    #[test]
+    fn highlight_match_unicode_case_fold() {
+        // ß lowercases to "ss" - pattern "ss" should still work
+        // The text has ß, searching for "ss" should not find it (different chars)
+        // But searching for "ß" in text with "ß" should work
+        let result = highlight_match("Straße", "ße");
+        assert!(result.contains(colors::BOLD_INVERSE));
     }
 }
