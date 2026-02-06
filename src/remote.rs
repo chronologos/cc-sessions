@@ -243,19 +243,6 @@ pub fn is_stale(remote_name: &str, settings: &Settings) -> Result<bool> {
     Ok(age.as_secs() > settings.stale_threshold)
 }
 
-/// Get the last sync time for a remote
-#[allow(dead_code)] // Useful for future staleness display
-pub fn get_last_sync(remote_name: &str, settings: &Settings) -> Result<Option<SystemTime>> {
-    let cache_dir = get_remote_cache_dir(settings, remote_name)?;
-    let last_sync_path = cache_dir.join(LAST_SYNC_FILE);
-
-    if !last_sync_path.exists() {
-        return Ok(None);
-    }
-
-    get_last_sync_time(&last_sync_path).map(Some)
-}
-
 /// Read the timestamp from .last_sync file
 fn get_last_sync_time(path: &PathBuf) -> Result<SystemTime> {
     let content = fs::read_to_string(path).context("Failed to read .last_sync file")?;

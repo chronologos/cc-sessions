@@ -188,7 +188,7 @@ Note: Each drill-down shows only **direct children**, not all descendants. To se
 
 #### Transcript Search (Ctrl+S)
 
-Ctrl+S performs full-text search across all session transcripts and **replaces the view** with matching results:
+Ctrl+S performs literal full-text search across session transcripts and **replaces the view** with matching results. Search respects active filters (`-r`, `-p`) — it only searches sessions already loaded in the picker, not the entire filesystem.
 
 - **Search**: Type query in filter prompt, press Ctrl+S to search
 - **Results**: List shows only sessions containing the search pattern

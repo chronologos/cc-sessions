@@ -102,55 +102,6 @@ pub fn find_all_sessions(
     Ok(all_sessions)
 }
 
-/// Search all sessions (local and cached remotes) for a pattern.
-pub fn search_all_sessions(
-    config: &crate::remote::Config,
-    pattern: &str,
-    remote_filter: Option<&str>,
-) -> Result<Vec<crate::Session>> {
-    use crate::remote;
-
-    let mut all_sessions = Vec::new();
-
-    // Search local sessions
-    if should_include_source(remote_filter, "local") {
-        let local_dir = get_claude_projects_dir()?;
-        if local_dir.exists() {
-            all_sessions.extend(search_sessions(&local_dir, pattern)?);
-        }
-    }
-
-    // Search cached remote sessions
-    for (name, remote_config) in &config.remotes {
-        if !should_include_source(remote_filter, name) {
-            continue;
-        }
-        // "local" filter should not include remotes
-        if remote_filter == Some("local") {
-            continue;
-        }
-
-        let cache_dir = match remote::get_remote_cache_dir(&config.settings, name) {
-            Ok(dir) if dir.exists() => dir,
-            _ => continue,
-        };
-
-        let source = SessionSource::Remote {
-            name: name.clone(),
-            host: remote_config.host.clone(),
-            user: remote_config.user.clone(),
-        };
-
-        match search_sessions_with_source(&cache_dir, pattern, source) {
-            Ok(sessions) => all_sessions.extend(sessions),
-            Err(e) => eprintln!("Warning: Failed to search sessions from '{}': {}", name, e),
-        }
-    }
-
-    all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
-    Ok(all_sessions)
-}
-
 // =============================================================================
 // Session Loading
 // =============================================================================
@@ -490,8 +441,9 @@ fn find_custom_title(filepath: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Extract text from message content (string or array of content blocks)
-fn extract_text_content(content: &serde_json::Value) -> Option<String> {
+/// Extract first text from message content (string or array of content blocks).
+/// Takes the `content` value directly (caller navigates to it).
+pub fn extract_text_content(content: &serde_json::Value) -> Option<String> {
     if let Some(s) = content.as_str() {
         return Some(s.to_string());
     }
@@ -509,61 +461,11 @@ fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 // Transcript Search
 // =============================================================================
 
-/// Search session transcripts for a pattern using grep crates.
-///
-/// Finds sessions containing the pattern and extracts metadata directly
-/// from the matching files (no index dependency).
-pub fn search_sessions(projects_dir: &PathBuf, pattern: &str) -> Result<Vec<Session>> {
-    search_sessions_with_source(projects_dir, pattern, SessionSource::Local)
-}
-
-/// Search sessions with a specific source tag.
-///
-/// Only searches within user/assistant message content (not tool outputs,
-/// system messages, or JSON structure). This matches what the preview shows.
-pub fn search_sessions_with_source(
-    projects_dir: &PathBuf,
-    pattern: &str,
-    source: SessionSource,
-) -> Result<Vec<Session>> {
-    let pattern_lower = pattern.to_lowercase();
-
-    // Find all .jsonl files with valid UUID filenames
-    let jsonl_files: Vec<PathBuf> = WalkDir::new(projects_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| is_valid_session_file(e.path()))
-        .map(|e| e.path().to_path_buf())
-        .collect();
-
-    // Search files in parallel - only match within message content
-    let matching_files: Vec<PathBuf> = jsonl_files
-        .par_iter()
-        .filter(|path| session_has_matching_message(path, &pattern_lower))
-        .cloned()
-        .collect();
-
-    // Extract metadata directly from matching files
-    let mut sessions: Vec<Session> = matching_files
-        .par_iter()
-        .filter_map(|filepath| {
-            let parent_dir = filepath
-                .parent()?
-                .file_name()?
-                .to_string_lossy()
-                .to_string();
-            extract_session_metadata(filepath, &parent_dir, source.clone())
-        })
-        .collect();
-
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
-    Ok(sessions)
-}
-
 /// Check if a session file contains the pattern in user/assistant message content.
 ///
 /// This ensures search results match what the preview will show.
-fn session_has_matching_message(filepath: &PathBuf, pattern_lower: &str) -> bool {
+/// Also used by interactive mode to filter the already-loaded session list.
+pub fn session_has_matching_message(filepath: &PathBuf, pattern_lower: &str) -> bool {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 

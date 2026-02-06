@@ -224,7 +224,7 @@ fn main() -> Result<()> {
         let list_sessions = filter_forks_for_list(&sessions, args.include_forks);
         print_sessions(&list_sessions, args.count, args.debug);
     } else {
-        interactive_mode(&sessions, args.fork, args.debug, &config)?;
+        interactive_mode(&sessions, args.fork, args.debug)?;
     }
 
     Ok(())
@@ -412,19 +412,7 @@ fn print_session_preview(filepath: &PathBuf) -> Result<()> {
 /// Extract text content from a message entry
 fn extract_message_text(entry: &serde_json::Value) -> Option<String> {
     let content = entry.get("message")?.get("content")?;
-
-    // Content can be a string or array of content blocks
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-
-    content.as_array()?.iter().find_map(|c| {
-        if c.get("type")?.as_str()? == "text" {
-            Some(c.get("text")?.as_str()?.to_string())
-        } else {
-            None
-        }
-    })
+    claude_code::extract_text_content(content)
 }
 
 /// Truncate string to max chars, adding ... if truncated
@@ -922,7 +910,6 @@ fn interactive_mode(
     sessions: &[Session],
     fork: bool,
     debug: bool,
-    config: &remote::Config,
 ) -> Result<()> {
     use skim::prelude::*;
     use std::collections::HashMap;
@@ -1043,21 +1030,24 @@ fn interactive_mode(
                 let query = out.query.trim();
 
                 // ctrl+s triggers transcript search - replaces view with matching sessions
+                // Searches within the already-loaded session list (respects -r/-p filters)
                 if out.final_key == Key::Ctrl('s') {
                     if query.is_empty() {
                         continue;
                     }
-                    match claude_code::search_all_sessions(config, query, None) {
-                        Ok(matched) => {
-                            let matched_ids: std::collections::HashSet<String> =
-                                matched.iter().map(|s| s.id.clone()).collect();
-                            search_results = Some(matched_ids);
-                            search_pattern = Some(query.to_string());
-                        }
-                        Err(e) => {
-                            eprintln!("Search error: {}", e);
-                        }
-                    }
+                    let pattern_lower = query.to_lowercase();
+                    let matched_ids: std::collections::HashSet<String> = sessions
+                        .iter()
+                        .filter(|s| {
+                            claude_code::session_has_matching_message(
+                                &s.filepath,
+                                &pattern_lower,
+                            )
+                        })
+                        .map(|s| s.id.clone())
+                        .collect();
+                    search_results = Some(matched_ids);
+                    search_pattern = Some(query.to_string());
                     continue;
                 }
 
@@ -1331,76 +1321,6 @@ mod tests {
         assert_eq!(children_map.get("root").unwrap().len(), 1);
         assert_eq!(children_map.get("child").unwrap().len(), 1);
         assert!(!children_map.contains_key("grandchild"));
-    }
-
-    // =========================================================================
-    // Subtree collection (test-only helper for future use)
-    // =========================================================================
-
-    /// Collect a session and all its descendants into a vec (test helper)
-    fn collect_subtree<'a>(
-        session: &'a Session,
-        children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
-        result: &mut Vec<&'a Session>,
-    ) {
-        result.push(session);
-        if let Some(children) = children_map.get(&session.id) {
-            for child in children {
-                collect_subtree(child, children_map, result);
-            }
-        }
-    }
-
-    #[test]
-    fn collect_subtree_includes_all_descendants() {
-        // root -> child1, child2
-        // child1 -> grandchild
-        let root = test_session("root");
-        let mut child1 = test_session("child1");
-        child1.forked_from = Some("root".to_string());
-        let mut child2 = test_session("child2");
-        child2.forked_from = Some("root".to_string());
-        let mut grandchild = test_session("grandchild");
-        grandchild.forked_from = Some("child1".to_string());
-
-        let sessions: Vec<&Session> = vec![&root, &child1, &child2, &grandchild];
-        let children_map = build_fork_tree(&sessions);
-
-        let mut result = Vec::new();
-        collect_subtree(&root, &children_map, &mut result);
-
-        assert_eq!(result.len(), 4);
-        let ids: Vec<&str> = result.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"root"));
-        assert!(ids.contains(&"child1"));
-        assert!(ids.contains(&"child2"));
-        assert!(ids.contains(&"grandchild"));
-    }
-
-    #[test]
-    fn collect_subtree_from_middle_excludes_siblings() {
-        // root -> child1, child2
-        // child1 -> grandchild
-        let root = test_session("root");
-        let mut child1 = test_session("child1");
-        child1.forked_from = Some("root".to_string());
-        let mut child2 = test_session("child2");
-        child2.forked_from = Some("root".to_string());
-        let mut grandchild = test_session("grandchild");
-        grandchild.forked_from = Some("child1".to_string());
-
-        let sessions: Vec<&Session> = vec![&root, &child1, &child2, &grandchild];
-        let children_map = build_fork_tree(&sessions);
-
-        let mut result = Vec::new();
-        collect_subtree(&child1, &children_map, &mut result);
-
-        assert_eq!(result.len(), 2);
-        let ids: Vec<&str> = result.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"child1"));
-        assert!(ids.contains(&"grandchild"));
-        assert!(!ids.contains(&"root"));
-        assert!(!ids.contains(&"child2"));
     }
 
     // =========================================================================
