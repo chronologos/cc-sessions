@@ -38,8 +38,8 @@ struct Args {
     #[arg(long, help_heading = "Interactive only")]
     fork: bool,
 
-    /// Show session ID prefixes and extra stats. Works in both modes
-    #[arg(long, help_heading = "Interactive only")]
+    /// Show session ID prefixes and extra stats
+    #[arg(long, help_heading = "Mode")]
     debug: bool,
 
     // -------------------------------------------------------------------------

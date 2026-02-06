@@ -347,20 +347,9 @@ fn count_turns(filepath: &Path) -> usize {
         };
 
         // Get text from content (string or array of blocks)
-        let text = if let Some(s) = content.as_str() {
-            s.to_string()
-        } else if let Some(arr) = content.as_array() {
-            arr.iter()
-                .find_map(|c| {
-                    if c.get("type")?.as_str()? == "text" {
-                        Some(c.get("text")?.as_str()?.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default()
-        } else {
-            continue;
+        let text = match extract_text_content(content) {
+            Some(t) => t,
+            None => continue,
         };
 
         // Skip system content (starts with <, [, or /)
@@ -465,7 +454,7 @@ pub fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 ///
 /// This ensures search results match what the preview will show.
 /// Also used by interactive mode to filter the already-loaded session list.
-pub fn session_has_matching_message(filepath: &PathBuf, pattern_lower: &str) -> bool {
+pub fn session_has_matching_message(filepath: &Path, pattern_lower: &str) -> bool {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
@@ -499,6 +488,8 @@ pub fn session_has_matching_message(filepath: &PathBuf, pattern_lower: &str) -> 
 }
 
 /// Extract text from message content for search purposes.
+/// Unlike `extract_text_content` (which returns the first text block),
+/// this joins ALL text blocks — a search match could be in any block.
 fn extract_message_text_for_search(entry: &serde_json::Value) -> Option<String> {
     let content = entry.get("message")?.get("content")?;
 
