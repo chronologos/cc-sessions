@@ -13,55 +13,82 @@ use std::time::SystemTime;
 // =============================================================================
 
 #[derive(Parser)]
-#[command(name = "cc-session", about = "List Claude Code sessions")]
+#[command(
+    name = "cc-sessions",
+    about = "List and resume Claude Code sessions across projects and machines"
+)]
 struct Args {
-    /// Number of sessions to show (for list mode)
-    #[arg(long, default_value = "15")]
-    count: usize,
+    // -------------------------------------------------------------------------
+    // Mode
+    // -------------------------------------------------------------------------
 
-    /// List mode (non-interactive) - show sessions as a table
-    #[arg(long)]
+    /// List mode: print sessions as a table (no picker, no preview). Use without --list for interactive picker
+    #[arg(long, help_heading = "Mode")]
     list: bool,
 
-    /// Fork session instead of resuming (creates new session ID)
-    #[arg(long)]
+    /// Number of sessions to show [default: 15]. List only (ignored in interactive mode)
+    #[arg(long, default_value = "15", help_heading = "Mode")]
+    count: usize,
+
+    // -------------------------------------------------------------------------
+    // Interactive-only (ignored with --list)
+    // -------------------------------------------------------------------------
+
+    /// Fork session instead of resuming (creates new session ID). Interactive only; ignored with --list
+    #[arg(long, help_heading = "Interactive only")]
     fork: bool,
 
+    /// Show session ID prefixes and extra stats. Works in both modes
+    #[arg(long, help_heading = "Interactive only")]
+    debug: bool,
+
+    // -------------------------------------------------------------------------
+    // List-only
+    // -------------------------------------------------------------------------
+
+    /// Include forked sessions in the table. List only (interactive mode shows forks via → navigation)
+    #[arg(long, help_heading = "List only")]
+    include_forks: bool,
+
+    // -------------------------------------------------------------------------
+    // Filtering (both modes)
+    // -------------------------------------------------------------------------
+
     /// Filter by project name (substring match, case-insensitive)
-    #[arg(long)]
+    #[arg(long, help_heading = "Filtering")]
     project: Option<String>,
 
     /// Minimum number of conversation turns (filters out one-shot sessions)
-    #[arg(long)]
+    #[arg(long, help_heading = "Filtering")]
     min_turns: Option<usize>,
 
-    /// Preview a session file (internal use by interactive mode)
-    #[arg(long, value_name = "FILE")]
-    preview: Option<PathBuf>,
-
-    /// Debug mode - show session IDs and stats
-    #[arg(long)]
-    debug: bool,
-
-    /// Include forked sessions in list mode
-    #[arg(long)]
-    include_forks: bool,
-
-    /// Filter to sessions from a specific remote (or "local")
-    #[arg(long, value_name = "NAME")]
+    /// Filter to sessions from a specific remote (e.g. devbox) or "local"
+    #[arg(long, value_name = "NAME", help_heading = "Filtering")]
     remote: Option<String>,
 
+    // -------------------------------------------------------------------------
+    // Remote sync
+    // -------------------------------------------------------------------------
+
     /// Force sync all remotes before listing
-    #[arg(long)]
+    #[arg(long, help_heading = "Remote sync")]
     sync: bool,
 
-    /// Skip auto-sync (use cached data only)
-    #[arg(long)]
+    /// Skip auto-sync (use cached remote data only)
+    #[arg(long, help_heading = "Remote sync")]
     no_sync: bool,
 
-    /// Sync remotes and exit (for cron/scripting)
-    #[arg(long)]
+    /// Sync all remotes and exit; no listing or picker (e.g. for cron). Other flags ignored
+    #[arg(long, help_heading = "Remote sync")]
     sync_only: bool,
+
+    // -------------------------------------------------------------------------
+    // Internal (hidden from --help)
+    // -------------------------------------------------------------------------
+
+    /// Preview a session file (used internally by interactive picker)
+    #[arg(long, value_name = "FILE", hide = true)]
+    preview: Option<PathBuf>,
 }
 
 // =============================================================================
@@ -260,7 +287,7 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
         }
 
         println!("{}", "─".repeat(100));
-        println!("Use 'cc-sessions' for interactive picker, --fork to fork");
+        println!("Run without --list for interactive picker; use --fork to fork when resuming");
     }
 }
 

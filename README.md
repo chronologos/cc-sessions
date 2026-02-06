@@ -52,6 +52,8 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 
 ### Interactive mode (default)
 
+*Preview, transcript search, and fork navigation are **interactive-only**; they are not available in list mode.*
+
 - **Fuzzy search** through project names and summaries
 - **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
 - **ctrl+s** for full-text transcript search — replaces view with matching sessions, esc clears
@@ -67,7 +69,7 @@ Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, 
 
 ### List mode (`--list`)
 
-Shows sessions as a table with relative timestamps, message counts, and AI-generated summaries:
+Plain table output: no preview, no transcript search, no fork drill-down. Use `--count` and `--include-forks` to control how many sessions and whether forked sessions are shown.
 
 ```
 CRE  MOD  MSG SOURCE PROJECT      SUMMARY
@@ -78,6 +80,14 @@ CRE  MOD  MSG SOURCE PROJECT      SUMMARY
 ```
 
 Sessions renamed with `/rename` in Claude Code show a `★` prefix.
+
+### Remote sessions and sync
+
+If you use remote sessions (configured in `~/.config/cc-sessions/remotes.toml`):
+
+- **`--sync`** — Force sync all remotes before listing (otherwise remotes are auto-synced when stale).
+- **`--no-sync`** — Skip auto-sync; use cached remote data only.
+- **`--sync-only`** — Sync all remotes and exit (no listing or picker). Useful for cron or scripts.
 
 ### Forked sessions
 
