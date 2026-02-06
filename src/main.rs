@@ -730,6 +730,7 @@ fn highlight_match(text: &str, pattern: &str) -> String {
 
 /// Escape a string for safe inclusion in single-quoted shell argument.
 /// Handles single quotes by ending the quote, adding escaped quote, reopening.
+/// Only used for remote SSH commands where shell invocation is unavoidable.
 fn shell_escape(s: &str) -> String {
     s.replace("'", "'\\''")
 }
@@ -739,7 +740,6 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
     use std::process::Command;
 
     let action = if fork { "Forking" } else { "Resuming" };
-    let fork_flag = if fork { " --fork-session" } else { "" };
     let project_path = &session.project_path;
 
     // Validate project path
@@ -748,14 +748,6 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
         eprintln!("Session file: {}", filepath.display());
         anyhow::bail!("Cannot resume: no project path");
     }
-
-    // Build the claude command with properly escaped arguments
-    let claude_cmd = format!(
-        "cd '{}' && claude -r '{}'{}",
-        shell_escape(project_path),
-        shell_escape(&session.id),
-        fork_flag
-    );
 
     let status = match &session.source {
         SessionSource::Local => {
@@ -774,7 +766,14 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
                 action, session.id, session.project_path
             );
 
-            Command::new("zsh").args(["-c", &claude_cmd]).status()?
+            // Invoke claude directly — no shell, no escaping needed
+            let mut cmd = Command::new("claude");
+            cmd.current_dir(project_path)
+                .args(["-r", &session.id]);
+            if fork {
+                cmd.arg("--fork-session");
+            }
+            cmd.status()?
         }
         SessionSource::Remote { name, host, user } => {
             let ssh_target = match user {
@@ -785,6 +784,15 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
             println!(
                 "{} remote session {} on {} in {}",
                 action, session.id, name, session.project_path
+            );
+
+            // Remote requires shell string — escape for safe single-quoting
+            let fork_flag = if fork { " --fork-session" } else { "" };
+            let claude_cmd = format!(
+                "cd '{}' && claude -r '{}'{}",
+                shell_escape(project_path),
+                shell_escape(&session.id),
+                fork_flag
             );
 
             // -t allocates a pseudo-TTY (required for claude's interactive mode)
