@@ -9,7 +9,8 @@
       "Bash(just install:*)",
       "Bash(eza:*)",
       "Bash(~/.local/bin/cc-sessions:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(just build:*)"
     ]
   },
   "enableAllProjectMcpServers": true,

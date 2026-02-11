@@ -253,6 +253,11 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
                 &session.id
             };
             let desc = format_session_desc(session, 30);
+            let desc = if session.name.is_some() {
+                format!("{}{}{}", colors::YELLOW, desc, colors::RESET)
+            } else {
+                desc
+            };
 
             println!(
                 "{:<6} {:<6} {:<4} {:<8} {:<16} {:<40} {}",
@@ -276,6 +281,11 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
             let desc = format_session_desc(session, 50);
             let desc = if session.forked_from.is_some() {
                 format!("↳ {}", desc)
+            } else {
+                desc
+            };
+            let desc = if session.name.is_some() {
+                format!("{}{}{}", colors::YELLOW, desc, colors::RESET)
             } else {
                 desc
             };
@@ -884,6 +894,13 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
     };
     let msgs = format!("{:>3}", session.turn_count);
 
+    let desc = format_session_desc(session, 40);
+    let desc_colored = if session.name.is_some() {
+        format!("{}{}{}", colors::YELLOW, desc, colors::RESET)
+    } else {
+        desc
+    };
+
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
         prefix,
@@ -893,7 +910,7 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
         msgs,
         source,
         session.project,
-        format_session_desc(session, 40),
+        desc_colored,
     )
 }
 
@@ -1103,7 +1120,7 @@ impl SkimItem for SessionItem {
     }
 
     fn display<'a>(&'a self, _context: DisplayContext<'a>) -> AnsiString<'a> {
-        AnsiString::from(self.display.as_str())
+        AnsiString::parse(self.display.as_str())
     }
 
     fn output(&self) -> Cow<'_, str> {
