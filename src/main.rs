@@ -1,9 +1,12 @@
 mod claude_code;
+mod message_classification;
 mod remote;
+mod session;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use skim::prelude::*;
+use session::{Session, SessionSource};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -82,6 +85,10 @@ struct Args {
     #[arg(long, help_heading = "Remote sync")]
     sync_only: bool,
 
+    /// Treat any remote sync/discovery source failure as fatal
+    #[arg(long, help_heading = "Remote sync")]
+    strict: bool,
+
     // -------------------------------------------------------------------------
     // Internal (hidden from --help)
     // -------------------------------------------------------------------------
@@ -89,56 +96,6 @@ struct Args {
     /// Preview a session file (used internally by interactive picker)
     #[arg(long, value_name = "FILE", hide = true)]
     preview: Option<PathBuf>,
-}
-
-// =============================================================================
-// Session Model (abstraction layer)
-// =============================================================================
-
-/// Where a session originated from
-#[derive(Debug, Clone)]
-pub enum SessionSource {
-    /// Local session from ~/.claude/projects
-    Local,
-    /// Remote session synced via SSH
-    Remote {
-        /// Config key (e.g., "devbox")
-        name: String,
-        /// SSH alias or raw hostname/IP
-        host: String,
-        /// Only needed for raw hosts without SSH config
-        user: Option<String>,
-    },
-}
-
-impl SessionSource {
-    /// Display name for the source (e.g., "local", "devbox")
-    pub fn display_name(&self) -> &str {
-        match self {
-            SessionSource::Local => "local",
-            SessionSource::Remote { name, .. } => name,
-        }
-    }
-
-    pub fn is_local(&self) -> bool {
-        matches!(self, SessionSource::Local)
-    }
-}
-
-#[derive(Debug)]
-pub struct Session {
-    pub id: String,
-    pub project: String,
-    pub project_path: String,
-    pub filepath: PathBuf,
-    pub created: SystemTime,
-    pub modified: SystemTime,
-    pub first_message: Option<String>,
-    pub summary: Option<String>,
-    pub name: Option<String>,       // customTitle from /rename - indicates important session
-    pub turn_count: usize,          // Number of user messages (conversation turns)
-    pub source: SessionSource,      // Where this session came from
-    pub forked_from: Option<String>, // Parent session ID if this is a fork
 }
 
 // =============================================================================
@@ -160,44 +117,63 @@ fn main() -> Result<()> {
     // Handle sync operations
     if args.sync_only {
         // Sync all remotes and exit
-        let results = remote::sync_all(&config)?;
-        for result in &results {
+        let summary = remote::sync_all(&config)?;
+        for result in &summary.successes {
             println!(
                 "Synced '{}' in {:.1}s",
                 result.remote_name,
                 result.duration.as_secs_f64()
             );
         }
-        if results.is_empty() {
+        for failure in &summary.failures {
+            eprintln!(
+                "Warning: Failed to sync '{}': {}",
+                failure.remote_name, failure.reason
+            );
+        }
+        if summary.successes.is_empty() {
             println!("No remotes configured. Add remotes to ~/.config/cc-sessions/remotes.toml");
         }
+        enforce_strict_mode(args.strict, summary.failure_count(), 0)?;
         return Ok(());
     }
 
+    let mut sync_failures = 0;
+
     if args.sync {
         // Force sync all remotes
-        let results = remote::sync_all(&config)?;
-        for result in &results {
+        let summary = remote::sync_all(&config)?;
+        for result in &summary.successes {
             eprintln!(
                 "Synced '{}' in {:.1}s",
                 result.remote_name,
                 result.duration.as_secs_f64()
             );
         }
+        sync_failures = summary.failure_count();
     } else if !args.no_sync && !config.remotes.is_empty() {
         // Auto-sync stale remotes
-        let results = remote::sync_if_stale(&config)?;
-        for result in &results {
+        let summary = remote::sync_if_stale(&config)?;
+        for result in &summary.successes {
             eprintln!(
                 "Auto-synced '{}' in {:.1}s",
                 result.remote_name,
                 result.duration.as_secs_f64()
             );
         }
+        sync_failures = summary.failure_count();
     }
 
     // Find sessions from all sources (local + remotes)
-    let mut sessions = claude_code::find_all_sessions(&config, args.remote.as_deref())?;
+    let discovery = claude_code::find_all_sessions_with_summary(&config, args.remote.as_deref())?;
+    for failure in &discovery.failures {
+        eprintln!(
+            "Warning: Failed to load sessions from '{}': {}",
+            failure.source_name, failure.reason
+        );
+    }
+    enforce_strict_mode(args.strict, sync_failures, discovery.failure_count())?;
+    let mut sessions = discovery.sessions;
 
     // Filter by project name if specified
     if let Some(ref filter) = args.project {
@@ -225,6 +201,29 @@ fn main() -> Result<()> {
         print_sessions(&list_sessions, args.count, args.debug);
     } else {
         interactive_mode(&sessions, args.fork, args.debug)?;
+    }
+
+    Ok(())
+}
+
+fn enforce_strict_mode(
+    strict: bool,
+    sync_failures: usize,
+    discovery_failures: usize,
+) -> Result<()> {
+    if !strict {
+        return Ok(());
+    }
+
+    if sync_failures > 0 {
+        anyhow::bail!("Strict mode: {} sync source(s) failed", sync_failures);
+    }
+
+    if discovery_failures > 0 {
+        anyhow::bail!(
+            "Strict mode: {} discovery source(s) failed",
+            discovery_failures
+        );
     }
 
     Ok(())
@@ -923,6 +922,47 @@ fn build_column_legend(debug: bool) -> String {
     )
 }
 
+/// Compute visible sessions based on current search and subtree focus state.
+/// Search mode takes priority and temporarily replaces subtree/root views.
+fn visible_sessions_for_view<'a>(
+    sessions: &'a [Session],
+    session_by_id: &std::collections::HashMap<&str, &'a Session>,
+    children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
+    search_results: Option<&std::collections::HashSet<String>>,
+    focus: Option<&String>,
+) -> Vec<&'a Session> {
+    if let Some(matched_ids) = search_results {
+        // Search mode: show only sessions that matched the search
+        return sessions
+            .iter()
+            .filter(|s| matched_ids.contains(&s.id))
+            .collect();
+    }
+
+    if let Some(focus_id) = focus {
+        // Subtree mode: show focused session + direct children only
+        let mut result = Vec::new();
+        if let Some(session) = session_by_id.get(focus_id.as_str()) {
+            result.push(*session);
+            if let Some(children) = children_map.get(focus_id) {
+                result.extend(children.iter().copied());
+            }
+        }
+        return result;
+    }
+
+    // Root view: only show sessions without a parent (or orphaned forks)
+    sessions
+        .iter()
+        .filter(|s| {
+            s.forked_from
+                .as_ref()
+                .map(|p| !session_by_id.contains_key(p.as_str()))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 fn interactive_mode(
     sessions: &[Session],
     fork: bool,
@@ -945,34 +985,13 @@ fn interactive_mode(
         // Build visible sessions based on search results or focus
         // Search results take priority - they replace the view temporarily
         let focus = focus_stack.last();
-        let visible_sessions: Vec<&Session> = if let Some(ref matched_ids) = search_results {
-            // Search mode: show only sessions that matched the search
-            sessions
-                .iter()
-                .filter(|s| matched_ids.contains(&s.id))
-                .collect()
-        } else if let Some(focus_id) = focus {
-            // Subtree mode: show focused session + direct children only
-            let mut result = Vec::new();
-            if let Some(session) = session_by_id.get(focus_id.as_str()) {
-                result.push(*session);
-                if let Some(children) = children_map.get(focus_id) {
-                    result.extend(children.iter());
-                }
-            }
-            result
-        } else {
-            // Root view: only show sessions without a parent (or orphaned forks)
-            sessions
-                .iter()
-                .filter(|s| {
-                    s.forked_from
-                        .as_ref()
-                        .map(|p| !session_by_id.contains_key(p.as_str()))
-                        .unwrap_or(true)
-                })
-                .collect()
-        };
+        let visible_sessions = visible_sessions_for_view(
+            sessions,
+            &session_by_id,
+            &children_map,
+            search_results.as_ref(),
+            focus,
+        );
 
         // Build display info
         let mut session_info: HashMap<String, (bool, Option<&str>)> = HashMap::new();
@@ -1520,5 +1539,92 @@ mod tests {
         // But searching for "ß" in text with "ß" should work
         let result = highlight_match("Straße", "ße");
         assert!(result.contains(colors::BOLD_INVERSE));
+    }
+
+    #[test]
+    fn search_results_replace_subtree_until_esc() {
+        use std::collections::{HashMap, HashSet};
+
+        let root = test_session("root");
+        let mut child = test_session("child");
+        child.forked_from = Some("root".to_string());
+        let sibling = test_session("sibling");
+
+        let sessions = vec![root, child, sibling];
+        let session_by_id: HashMap<&str, &Session> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
+
+        // Focused subtree should show root + child
+        let focus = Some("root".to_string());
+        let visible = visible_sessions_for_view(
+            &sessions,
+            &session_by_id,
+            &children_map,
+            None,
+            focus.as_ref(),
+        );
+        let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "child"]);
+
+        // Search should replace subtree view
+        let mut matched = HashSet::new();
+        matched.insert("sibling".to_string());
+        let visible = visible_sessions_for_view(
+            &sessions,
+            &session_by_id,
+            &children_map,
+            Some(&matched),
+            focus.as_ref(),
+        );
+        let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["sibling"]);
+
+        // Clearing search restores subtree view
+        let visible = visible_sessions_for_view(
+            &sessions,
+            &session_by_id,
+            &children_map,
+            None,
+            focus.as_ref(),
+        );
+        let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["root", "child"]);
+    }
+
+    #[test]
+    fn strict_mode_fails_when_any_remote_sync_fails() {
+        let result = enforce_strict_mode(true, 1, 0);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Strict mode: 1 sync source(s) failed")
+        );
+    }
+
+    #[test]
+    fn strict_mode_fails_when_any_discovery_source_fails() {
+        let result = enforce_strict_mode(true, 0, 2);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Strict mode: 2 discovery source(s) failed")
+        );
+    }
+
+    #[test]
+    fn strict_mode_disabled_allows_failures() {
+        assert!(enforce_strict_mode(false, 3, 4).is_ok());
+    }
+
+    #[test]
+    fn session_source_display_name_local() {
+        let source = crate::session::SessionSource::Local;
+        assert_eq!(source.display_name(), "local");
+        assert!(source.is_local());
     }
 }

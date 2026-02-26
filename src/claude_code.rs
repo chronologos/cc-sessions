@@ -19,7 +19,8 @@
 //! Metadata is extracted directly from file contents (head + tail) rather than
 //! relying on `sessions-index.json` which is often stale.
 
-use crate::{Session, SessionSource};
+use crate::session::{Session, SessionSource};
+use crate::message_classification::{counts_as_turn, is_first_prompt_candidate};
 use anyhow::{Context, Result};
 use grep_regex::RegexMatcher;
 use grep_searcher::Searcher;
@@ -30,6 +31,30 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
+
+/// Failure details for a single session discovery source.
+#[derive(Debug)]
+pub struct DiscoveryFailure {
+    pub source_name: String,
+    pub reason: String,
+}
+
+/// Aggregated discovery outcome across local + remote sources.
+#[derive(Debug, Default)]
+pub struct DiscoverySummary {
+    pub sessions: Vec<Session>,
+    pub failures: Vec<DiscoveryFailure>,
+}
+
+impl DiscoverySummary {
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
 
 // =============================================================================
 // Path Discovery
@@ -48,26 +73,20 @@ fn should_include_source(remote_filter: Option<&str>, source_name: &str) -> bool
     }
 }
 
-/// Find all sessions from local and cached remotes.
-///
-/// Combines:
-/// - Local sessions from ~/.claude/projects
-/// - Cached remote sessions from each configured remote
-///
-/// Sessions are sorted by modified time (most recent first).
-pub fn find_all_sessions(
+/// Find all sessions from local and cached remotes with source-level failures.
+pub fn find_all_sessions_with_summary(
     config: &crate::remote::Config,
     remote_filter: Option<&str>,
-) -> Result<Vec<crate::Session>> {
+) -> Result<DiscoverySummary> {
     use crate::remote;
 
-    let mut all_sessions = Vec::new();
+    let mut summary = DiscoverySummary::default();
 
     // Load local sessions
     if should_include_source(remote_filter, "local") {
         let local_dir = get_claude_projects_dir()?;
         if local_dir.exists() {
-            all_sessions.extend(find_sessions(&local_dir)?);
+            summary.sessions.extend(find_sessions(&local_dir)?);
         }
     }
 
@@ -93,13 +112,16 @@ pub fn find_all_sessions(
         };
 
         match find_sessions_with_source(&cache_dir, source) {
-            Ok(sessions) => all_sessions.extend(sessions),
-            Err(e) => eprintln!("Warning: Failed to load sessions from '{}': {}", name, e),
+            Ok(sessions) => summary.sessions.extend(sessions),
+            Err(e) => summary.failures.push(DiscoveryFailure {
+                source_name: name.clone(),
+                reason: e.to_string(),
+            }),
         }
     }
 
-    all_sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
-    Ok(all_sessions)
+    summary.sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(summary)
 }
 
 // =============================================================================
@@ -278,9 +300,8 @@ fn read_file_head(filepath: &Path) -> HeadMetadata {
             if first_prompt.is_none() && entry_type == Some("user") {
                 if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
                     if let Some(t) = extract_text_content(content) {
-                        // Filter out system prompts and XML-tagged content
-                        if !t.starts_with('/') && !t.starts_with("[Request") && !t.starts_with('<')
-                        {
+                        // Filter out non-user prompt content while preserving existing behavior.
+                        if is_first_prompt_candidate(&t) {
                             first_prompt = Some(crate::normalize_summary(&t, 50));
                         }
                     }
@@ -352,9 +373,8 @@ fn count_turns(filepath: &Path) -> usize {
             None => continue,
         };
 
-        // Skip system content (starts with <, [, or /)
-        if text.is_empty() || text.starts_with('<') || text.starts_with('[') || text.starts_with('/')
-        {
+        // Skip content that should not count as conversation turns.
+        if !counts_as_turn(&text) {
             continue;
         }
 
@@ -1019,5 +1039,67 @@ mod tests {
         assert_eq!(count, 0);
 
         fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn first_prompt_and_turn_count_current_filter_behavior() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-first-prompt-turns-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"[tool output that is not Request]"},"cwd":"/Users/test/project"}
+{"type":"user","message":{"role":"user","content":"Real user question"}}"#,
+        )
+        .unwrap();
+
+        let head = read_file_head(&session_path);
+        let count = count_turns(&session_path);
+
+        // Characterization: first prompt currently excludes [Request... but not all bracketed text.
+        assert_eq!(
+            head.first_prompt,
+            Some("[tool output that is not Request]".to_string())
+        );
+        // Characterization: turn counting excludes all bracketed entries.
+        assert_eq!(count, 1);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn discovery_summary_tracks_source_failures() {
+        let summary = DiscoverySummary {
+            sessions: Vec::new(),
+            failures: vec![DiscoveryFailure {
+                source_name: "devbox".to_string(),
+                reason: "cache unreadable".to_string(),
+            }],
+        };
+
+        assert_eq!(summary.failure_count(), 1);
+        assert!(summary.has_failures());
+    }
+
+    #[test]
+    fn classify_user_text_for_metrics_table() {
+        use crate::message_classification::{MessageKind, classify_user_text_for_metrics};
+
+        let cases = [
+            ("normal user text", MessageKind::UserContent),
+            ("/help", MessageKind::SlashCommand),
+            (
+                "<command-message>init</command-message>",
+                MessageKind::CommandTag,
+            ),
+            ("[local command output]", MessageKind::BracketedOutput),
+            ("", MessageKind::Empty),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(classify_user_text_for_metrics(text), expected);
+        }
     }
 }

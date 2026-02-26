@@ -221,6 +221,34 @@ pub struct SyncResult {
     pub duration: Duration,
 }
 
+/// Failure details for a remote sync attempt.
+#[derive(Debug)]
+pub struct SyncFailure {
+    pub remote_name: String,
+    pub reason: String,
+}
+
+/// Aggregated sync outcome across all attempted remotes.
+#[derive(Debug, Default)]
+pub struct SyncSummary {
+    pub successes: Vec<SyncResult>,
+    pub failures: Vec<SyncFailure>,
+}
+
+impl SyncSummary {
+    pub fn success_count(&self) -> usize {
+        self.successes.len()
+    }
+
+    pub fn failure_count(&self) -> usize {
+        self.failures.len()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failures.is_empty()
+    }
+}
+
 // =============================================================================
 // Staleness Tracking
 // =============================================================================
@@ -265,8 +293,8 @@ fn update_last_sync(cache_dir: &Path) -> Result<()> {
 }
 
 /// Sync remotes, optionally checking staleness first.
-fn sync_remotes(config: &Config, check_staleness: bool) -> Result<Vec<SyncResult>> {
-    let mut results = Vec::new();
+fn sync_remotes(config: &Config, check_staleness: bool) -> Result<SyncSummary> {
+    let mut summary = SyncSummary::default();
 
     for (name, remote) in &config.remotes {
         // Skip non-stale remotes if checking staleness
@@ -275,23 +303,30 @@ fn sync_remotes(config: &Config, check_staleness: bool) -> Result<Vec<SyncResult
         }
 
         match sync_remote(name, remote, &config.settings) {
-            Ok(result) => results.push(result),
-            Err(e) => eprintln!("Warning: Failed to sync '{}': {}", name, e),
+            Ok(result) => summary.successes.push(result),
+            Err(e) => {
+                let reason = e.to_string();
+                eprintln!("Warning: Failed to sync '{}': {}", name, reason);
+                summary.failures.push(SyncFailure {
+                    remote_name: name.clone(),
+                    reason,
+                });
+            }
         }
     }
 
-    Ok(results)
+    Ok(summary)
 }
 
 /// Sync remotes if they are stale
 ///
 /// Returns the list of remotes that were synced
-pub fn sync_if_stale(config: &Config) -> Result<Vec<SyncResult>> {
+pub fn sync_if_stale(config: &Config) -> Result<SyncSummary> {
     sync_remotes(config, true)
 }
 
 /// Sync all configured remotes regardless of staleness
-pub fn sync_all(config: &Config) -> Result<Vec<SyncResult>> {
+pub fn sync_all(config: &Config) -> Result<SyncSummary> {
     sync_remotes(config, false)
 }
 
@@ -382,5 +417,23 @@ stale_threshold = 7200
 
         assert_eq!(config.settings.cache_dir, "~/.cache/my-cache");
         assert_eq!(config.settings.stale_threshold, 7200);
+    }
+
+    #[test]
+    fn sync_summary_tracks_successes_and_failures() {
+        let summary = SyncSummary {
+            successes: vec![SyncResult {
+                remote_name: "devbox".to_string(),
+                duration: Duration::from_secs(1),
+            }],
+            failures: vec![SyncFailure {
+                remote_name: "workstation".to_string(),
+                reason: "ssh timeout".to_string(),
+            }],
+        };
+
+        assert_eq!(summary.success_count(), 1);
+        assert_eq!(summary.failure_count(), 1);
+        assert!(summary.has_failures());
     }
 }
