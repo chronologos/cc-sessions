@@ -236,16 +236,8 @@ pub struct SyncSummary {
 }
 
 impl SyncSummary {
-    pub fn success_count(&self) -> usize {
-        self.successes.len()
-    }
-
     pub fn failure_count(&self) -> usize {
         self.failures.len()
-    }
-
-    pub fn has_failures(&self) -> bool {
-        !self.failures.is_empty()
     }
 }
 
@@ -432,8 +424,8 @@ stale_threshold = 7200
             }],
         };
 
-        assert_eq!(summary.success_count(), 1);
+        assert_eq!(summary.successes.len(), 1);
         assert_eq!(summary.failure_count(), 1);
-        assert!(summary.has_failures());
+        assert_eq!(summary.failures.len(), 1);
     }
 }

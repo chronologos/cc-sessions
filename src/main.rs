@@ -980,6 +980,7 @@ fn interactive_mode(
 
     // Navigation state - stack tracks drill-down history (empty = root view)
     let mut state = InteractiveState::default();
+    let mut search_text_index: Option<HashMap<String, String>> = None;
 
     loop {
         // Build visible sessions based on search results or focus
@@ -1069,15 +1070,16 @@ fn interactive_mode(
                     };
 
                     let pattern_lower = pattern.to_lowercase();
-                    let matched_ids: std::collections::HashSet<String> = sessions
+                    let index = search_text_index.get_or_insert_with(|| {
+                        sessions
+                            .iter()
+                            .map(|s| (s.id.clone(), claude_code::session_search_text_lower(&s.filepath)))
+                            .collect()
+                    });
+                    let matched_ids: std::collections::HashSet<String> = index
                         .iter()
-                        .filter(|s| {
-                            claude_code::session_has_matching_message(
-                                &s.filepath,
-                                &pattern_lower,
-                            )
-                        })
-                        .map(|s| s.id.clone())
+                        .filter(|(_, text)| text.contains(&pattern_lower))
+                        .map(|(id, _)| id.clone())
                         .collect();
                     let _ = state.apply(StateAction::ApplySearchResults {
                         pattern,

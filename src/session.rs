@@ -26,6 +26,7 @@ impl SessionSource {
         }
     }
 
+    #[cfg(test)]
     pub fn is_local(&self) -> bool {
         matches!(self, SessionSource::Local)
     }

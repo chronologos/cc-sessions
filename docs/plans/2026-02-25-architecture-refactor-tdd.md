@@ -315,3 +315,13 @@ Plan complete and saved to `docs/plans/2026-02-25-architecture-refactor-tdd.md`.
 2. Parallel Session (separate) - Open new session with executing-plans, batch execution with checkpoints
 
 Which approach?
+
+## Execution Status
+
+- [x] Task 1: Characterization Test Baseline
+- [x] Task 2: Explicit Sync/Discovery Health Reporting
+- [x] Task 3: Extract Domain Model from `main.rs`
+- [x] Task 4: Centralize Message Classification Rules
+- [x] Task 5: Extract Interactive State Machine
+- [x] Task 6: Reduce Repeated I/O and Search Rescans
+- [x] Task 7: Refactor Polish + Regression Verification

@@ -88,6 +88,9 @@ If you use remote sessions (configured in `~/.config/cc-sessions/remotes.toml`):
 - **`--sync`** — Force sync all remotes before listing (otherwise remotes are auto-synced when stale).
 - **`--no-sync`** — Skip auto-sync; use cached remote data only.
 - **`--sync-only`** — Sync all remotes and exit (no listing or picker). Useful for cron or scripts.
+- **`--strict`** — Treat any remote sync/discovery source failure as fatal (exits with error instead of warning).
+
+When `--strict` is not set, sync/discovery source failures are reported as warnings and available data is still shown.
 
 ### Forked sessions
 

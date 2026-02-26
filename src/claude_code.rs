@@ -50,10 +50,6 @@ impl DiscoverySummary {
     pub fn failure_count(&self) -> usize {
         self.failures.len()
     }
-
-    pub fn has_failures(&self) -> bool {
-        !self.failures.is_empty()
-    }
 }
 
 // =============================================================================
@@ -218,14 +214,14 @@ fn extract_session_metadata(
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     let created = metadata.created().unwrap_or(modified);
 
-    // Extract metadata from file head
-    let head = read_file_head(filepath);
+    // Extract metadata + turns in a single file pass
+    let scan = scan_head_turns_and_search(filepath);
+    let head = scan.head;
 
     // Extract metadata from file tail (summary, customTitle)
     let (summary, custom_title) = read_file_tail(filepath);
 
-    // Count conversation turns (user messages)
-    let turn_count = count_turns(filepath);
+    let turn_count = scan.turn_count;
 
     // Skip "empty" sessions that have no user content
     if head.project_path.is_empty() && head.first_prompt.is_none() && summary.is_none() {
@@ -258,68 +254,101 @@ struct HeadMetadata {
     forked_from: Option<String>,
 }
 
-/// Read the head of a session file to extract cwd, first user message, and fork parent
-fn read_file_head(filepath: &Path) -> HeadMetadata {
-    let mut project_path = String::new();
-    let mut first_prompt = None;
-    let mut forked_from = None;
+/// Output of single-pass scan over a session file.
+struct HeadTurnSearchScan {
+    head: HeadMetadata,
+    turn_count: usize,
+    search_text_lower: String,
+}
+
+/// Scan a session file once to collect:
+/// - head metadata (cwd, first prompt, forkedFrom)
+/// - user turn count
+/// - lowercase searchable transcript text (user + assistant)
+fn scan_head_turns_and_search(filepath: &Path) -> HeadTurnSearchScan {
+    let mut head = HeadMetadata::default();
+    let mut turn_count = 0;
+    let mut search_chunks = Vec::new();
 
     let Ok(file) = File::open(filepath) else {
-        return HeadMetadata::default();
+        return HeadTurnSearchScan {
+            head,
+            turn_count,
+            search_text_lower: String::new(),
+        };
     };
+
     let reader = BufReader::new(file);
 
-    for line in reader.lines().take(50) {
-        let line = match line {
-            Ok(l) => l,
+    for line in reader.lines().map_while(Result::ok) {
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
             Err(_) => continue,
         };
 
-        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
-            let entry_type = entry.get("type").and_then(|v| v.as_str());
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
 
-            // Extract cwd (project path) from any message with it
-            if project_path.is_empty() {
-                if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
-                    project_path = cwd.to_string();
-                }
+        // Head metadata: cwd
+        if head.project_path.is_empty() {
+            if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
+                head.project_path = cwd.to_string();
             }
+        }
 
-            // Extract forkedFrom.sessionId (present on entries if this is a forked session)
-            if forked_from.is_none() {
-                if let Some(parent_id) = entry
-                    .get("forkedFrom")
-                    .and_then(|f| f.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                {
-                    forked_from = Some(parent_id.to_string());
-                }
+        // Head metadata: fork parent
+        if head.forked_from.is_none() {
+            if let Some(parent_id) = entry
+                .get("forkedFrom")
+                .and_then(|f| f.get("sessionId"))
+                .and_then(|v| v.as_str())
+            {
+                head.forked_from = Some(parent_id.to_string());
             }
+        }
 
-            // Extract first user prompt
-            if first_prompt.is_none() && entry_type == Some("user") {
-                if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
-                    if let Some(t) = extract_text_content(content) {
-                        // Filter out non-user prompt content while preserving existing behavior.
-                        if is_first_prompt_candidate(&t) {
-                            first_prompt = Some(crate::normalize_summary(&t, 50));
-                        }
+        // Head metadata: first user prompt
+        if head.first_prompt.is_none() && entry_type == Some("user") {
+            if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
+                if let Some(text) = extract_text_content(content) {
+                    if is_first_prompt_candidate(&text) {
+                        head.first_prompt = Some(crate::normalize_summary(&text, 50));
                     }
                 }
             }
+        }
 
-            // Stop early if we have all three
-            if !project_path.is_empty() && first_prompt.is_some() && forked_from.is_some() {
-                break;
+        // Turn counting
+        if entry_type == Some("user") {
+            if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
+                if let Some(text) = extract_text_content(content) {
+                    if counts_as_turn(&text) {
+                        turn_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Search text (user + assistant, all text blocks)
+        if matches!(entry_type, Some("user") | Some("assistant")) {
+            if let Some(text) = extract_message_text_for_search(&entry) {
+                if !text.is_empty() {
+                    search_chunks.push(text);
+                }
             }
         }
     }
 
-    HeadMetadata {
-        project_path,
-        first_prompt,
-        forked_from,
+    HeadTurnSearchScan {
+        head,
+        turn_count,
+        search_text_lower: search_chunks.join("\n").to_lowercase(),
     }
+}
+
+/// Read the head of a session file to extract cwd, first user message, and fork parent
+#[cfg(test)]
+fn read_file_head(filepath: &Path) -> HeadMetadata {
+    scan_head_turns_and_search(filepath).head
 }
 
 /// Read the tail of a session file to extract summary and customTitle
@@ -338,50 +367,14 @@ fn read_file_tail(filepath: &Path) -> (Option<String>, Option<String>) {
 /// Only counts entries where:
 /// - type == "user"
 /// - message.content exists and is not system content (starts with <, [, or /)
+#[cfg(test)]
 fn count_turns(filepath: &Path) -> usize {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
+    scan_head_turns_and_search(filepath).turn_count
+}
 
-    let file = match File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return 0,
-    };
-
-    let reader = BufReader::new(file);
-    let mut count = 0;
-
-    for line in reader.lines().map_while(Result::ok) {
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Only count type == "user" entries
-        if entry.get("type").and_then(|v| v.as_str()) != Some("user") {
-            continue;
-        }
-
-        // Extract message content
-        let content = match entry.get("message").and_then(|m| m.get("content")) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Get text from content (string or array of blocks)
-        let text = match extract_text_content(content) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        // Skip content that should not count as conversation turns.
-        if !counts_as_turn(&text) {
-            continue;
-        }
-
-        count += 1;
-    }
-
-    count
+/// Build lowercase searchable transcript text for user/assistant messages.
+pub fn session_search_text_lower(filepath: &Path) -> String {
+    scan_head_turns_and_search(filepath).search_text_lower
 }
 
 /// Read summary from the tail of the file (last 16KB)
@@ -469,43 +462,6 @@ pub fn extract_text_content(content: &serde_json::Value) -> Option<String> {
 // =============================================================================
 // Transcript Search
 // =============================================================================
-
-/// Check if a session file contains the pattern in user/assistant message content.
-///
-/// This ensures search results match what the preview will show.
-/// Also used by interactive mode to filter the already-loaded session list.
-pub fn session_has_matching_message(filepath: &Path, pattern_lower: &str) -> bool {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = match File::open(filepath) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let reader = BufReader::new(file);
-
-    for line in reader.lines().map_while(Result::ok) {
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Only check user/assistant message entries
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-        if !matches!(entry_type, Some("user") | Some("assistant")) {
-            continue;
-        }
-
-        // Extract message content
-        if let Some(text) = extract_message_text_for_search(&entry) {
-            if text.to_lowercase().contains(pattern_lower) {
-                return true;
-            }
-        }
-    }
-
-    false
-}
 
 /// Extract text from message content for search purposes.
 /// Unlike `extract_text_content` (which returns the first text block),
@@ -1080,7 +1036,7 @@ mod tests {
         };
 
         assert_eq!(summary.failure_count(), 1);
-        assert!(summary.has_failures());
+        assert_eq!(summary.failures.len(), 1);
     }
 
     #[test]
@@ -1101,5 +1057,52 @@ mod tests {
         for (text, expected) in cases {
             assert_eq!(classify_user_text_for_metrics(text), expected);
         }
+    }
+
+    #[test]
+    fn scan_once_produces_equivalent_session_metadata() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-scan-once-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"Real prompt"},"cwd":"/Users/test/project"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"assistant reply"}]}}
+{"type":"user","message":{"role":"user","content":"/help"}
+{"type":"user","message":{"role":"user","content":"Second real prompt"}}"#,
+        )
+        .unwrap();
+
+        let scan = scan_head_turns_and_search(&session_path);
+
+        assert_eq!(scan.head.project_path, "/Users/test/project");
+        assert_eq!(scan.head.first_prompt, Some("Real prompt".to_string()));
+        assert_eq!(scan.turn_count, 2);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn session_search_text_lower_includes_user_and_assistant_text() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("cc-session-test-search-text-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"API status"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Service healthy"}]}}
+{"type":"summary","summary":"ignored summary"}"#,
+        )
+        .unwrap();
+
+        let text = session_search_text_lower(&session_path);
+        assert!(text.contains("api status"));
+        assert!(text.contains("service healthy"));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

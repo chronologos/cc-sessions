@@ -17,16 +17,24 @@ just lint     # Run clippy
 
 ```
 src/
-  main.rs         # CLI, display, skim - general/timeless code
-  claude_code.rs  # Session loading, JSONL parsing - format-specific
+  main.rs                   # CLI orchestration, display, skim integration
+  session.rs                # Session domain model (Session, SessionSource)
+  claude_code.rs            # Claude Code JSONL loading/parsing
+  message_classification.rs # Shared user-message classification rules
+  interactive_state.rs      # Pure reducer for interactive state transitions
+  remote.rs                 # Remote sync config + SSH/rsync operations
 ```
 
-**Boundary principle:** If Claude Code changes its storage format, changes should be isolated to `claude_code.rs`. The `Session` struct in `main.rs` acts as an abstraction layer.
+**Boundary principle:** If Claude Code changes its storage format, changes should be isolated to `claude_code.rs`. Session domain types live in `session.rs`; interactive navigation/search transitions live in `interactive_state.rs`; shared message filtering rules live in `message_classification.rs`.
 
 | Module | Responsibility | Changes when... |
 |--------|---------------|-----------------|
-| `main.rs` | CLI args, display formatting, skim integration | UI/UX requirements change |
-| `claude_code.rs` | JSONL reading, metadata extraction, path discovery | Claude Code format changes |
+| `main.rs` | CLI args, high-level orchestration, output formatting | UI/UX flow or command behavior changes |
+| `session.rs` | Session model and source typing | Session field/source semantics change |
+| `claude_code.rs` | JSONL reading, metadata extraction, scan/search text generation | Claude Code format changes |
+| `message_classification.rs` | Shared classification for first prompt + turn counting | User-content filtering rules change |
+| `interactive_state.rs` | Interactive reducer (`Esc`, `Ctrl+S`, arrows, `Enter`) | Navigation/search state machine changes |
+| `remote.rs` | Remote config loading and sync summaries | SSH/rsync behavior or remote policy changes |
 
 ### Session Storage Structure
 
@@ -76,9 +84,10 @@ All metadata is extracted directly from `.jsonl` files (no index dependency):
 
 1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
 2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
-3. **Extract** metadata from file head + tail:
-   - **HEAD** (first ~50 lines): `cwd` field → project path, first `user` message
-   - **TAIL** (last ~16KB): `summary` type entry, `custom-title` entry
+3. **Extract** metadata via scan + tail:
+   - **Single-pass scan**: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text
+   - **TAIL** (last ~16KB): `summary` type entry
+   - **Grep entire file**: `custom-title` entry
 4. **Timestamps** from filesystem (created, modified)
 5. **Filter out** empty sessions (no cwd, no user message, no summary)
 
@@ -198,6 +207,8 @@ Ctrl+S performs literal full-text search across session transcripts and **replac
 **What gets searched**: Only user/assistant message content. Tool outputs, system messages, and JSON metadata are excluded. This ensures search results match what the preview shows.
 
 **Design choice**: Search replaces the view temporarily rather than filtering within the current subtree. This ensures you can find any session regardless of navigation state. The search results persist until explicitly cleared with Esc.
+
+**Performance note**: The first Ctrl+S in a picker session builds an in-memory lowercase transcript index for loaded sessions; subsequent Ctrl+S queries reuse that index.
 
 ```
 Normal View                  After Ctrl+S "api"

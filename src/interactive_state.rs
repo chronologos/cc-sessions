@@ -41,6 +41,7 @@ impl InteractiveState {
         self.focus_stack.last()
     }
 
+    #[cfg(test)]
     pub fn push_focus_for_test(&mut self, id: &str) {
         self.focus_stack.push(id.to_string());
     }
