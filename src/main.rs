@@ -1,10 +1,12 @@
 mod claude_code;
+mod interactive_state;
 mod message_classification;
 mod remote;
 mod session;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use interactive_state::{Action as StateAction, Effect as StateEffect, InteractiveState};
 use skim::prelude::*;
 use session::{Session, SessionSource};
 use std::borrow::Cow;
@@ -977,19 +979,17 @@ fn interactive_mode(
     let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
 
     // Navigation state - stack tracks drill-down history (empty = root view)
-    let mut search_pattern: Option<String> = None;
-    let mut search_results: Option<std::collections::HashSet<String>> = None;
-    let mut focus_stack: Vec<String> = Vec::new();
+    let mut state = InteractiveState::default();
 
     loop {
         // Build visible sessions based on search results or focus
         // Search results take priority - they replace the view temporarily
-        let focus = focus_stack.last();
+        let focus = state.focus();
         let visible_sessions = visible_sessions_for_view(
             sessions,
             &session_by_id,
             &children_map,
-            search_results.as_ref(),
+            state.search_results(),
             focus,
         );
 
@@ -1001,7 +1001,8 @@ fn interactive_mode(
             session_info.insert(session.id.clone(), (has_children, parent_id));
         }
 
-        let search_count = search_results.as_ref().map(|r| r.len());
+        let search_count = state.search_results().map(|r| r.len());
+        let search_pattern = state.search_pattern().cloned();
         let header =
             build_subtree_header(&search_pattern, search_count, fork, focus, &session_by_id, debug);
 
@@ -1050,28 +1051,24 @@ fn interactive_mode(
 
         match output {
             Some(out) if out.is_abort => {
-                // Esc: if searching, clear search; if in subtree, go to root; otherwise exit
-                if search_results.is_some() {
-                    search_results = None;
-                    search_pattern = None;
-                    continue;
+                match state.apply(StateAction::Esc) {
+                    StateEffect::Continue => continue,
+                    StateEffect::Exit => return Ok(()),
+                    _ => continue,
                 }
-                if !focus_stack.is_empty() {
-                    focus_stack.clear();
-                    continue;
-                }
-                return Ok(());
             }
             Some(out) => {
-                let query = out.query.trim();
-
                 // ctrl+s triggers transcript search - replaces view with matching sessions
                 // Searches within the already-loaded session list (respects -r/-p filters)
                 if out.final_key == Key::Ctrl('s') {
-                    if query.is_empty() {
+                    let effect = state.apply(StateAction::CtrlS {
+                        query: out.query.to_string(),
+                    });
+                    let StateEffect::RunSearch { pattern } = effect else {
                         continue;
-                    }
-                    let pattern_lower = query.to_lowercase();
+                    };
+
+                    let pattern_lower = pattern.to_lowercase();
                     let matched_ids: std::collections::HashSet<String> = sessions
                         .iter()
                         .filter(|s| {
@@ -1082,38 +1079,38 @@ fn interactive_mode(
                         })
                         .map(|s| s.id.clone())
                         .collect();
-                    search_results = Some(matched_ids);
-                    search_pattern = Some(query.to_string());
+                    let _ = state.apply(StateAction::ApplySearchResults {
+                        pattern,
+                        matched_ids,
+                    });
                     continue;
                 }
 
                 // Right: drill into subtree if session has children
                 if out.final_key == Key::Right {
-                    if let Some(item) = out.selected_items.first() {
-                        let selected_id = item.output().to_string();
-                        // Don't push if already viewing this session's subtree
-                        let already_focused = focus_stack.last().map(|f| f == &selected_id).unwrap_or(false);
-                        if !already_focused {
-                            if let Some((has_children, _)) = session_info.get(&selected_id) {
-                                if *has_children {
-                                    focus_stack.push(selected_id);
-                                }
-                            }
-                        }
-                    }
+                    let selected_id = out.selected_items.first().map(|item| item.output().to_string());
+                    let has_children = selected_id
+                        .as_ref()
+                        .and_then(|id| session_info.get(id))
+                        .map(|(has_children, _)| *has_children)
+                        .unwrap_or(false);
+                    let _ = state.apply(StateAction::Right {
+                        selected_id,
+                        has_children,
+                    });
                     continue;
                 }
 
                 // Left: pop navigation stack (go back)
                 if out.final_key == Key::Left {
-                    focus_stack.pop();
+                    let _ = state.apply(StateAction::Left);
                     continue;
                 }
 
                 // Enter: select session
-                if let Some(item) = out.selected_items.first() {
-                    let selected_id = item.output().to_string();
-                    if let Some(session) = session_by_id.get(selected_id.as_str()) {
+                let selected_id = out.selected_items.first().map(|item| item.output().to_string());
+                if let StateEffect::Select { session_id } = state.apply(StateAction::Enter { selected_id }) {
+                    if let Some(session) = session_by_id.get(session_id.as_str()) {
                         resume_session(session, &session.filepath, fork)?;
                         return Ok(());
                     }
