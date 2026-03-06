@@ -916,15 +916,10 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
     let msgs = format!("{:>3}", session.turn_count);
 
     let desc = format_session_desc(session, 40);
-    let desc_colored = if session.name.is_some() {
-        format!("{}{}{}", colors::YELLOW, desc, colors::RESET)
-    } else {
-        desc
-    };
 
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
-        prefix, id_prefix, created, modified, msgs, source, session.project, desc_colored,
+        prefix, id_prefix, created, modified, msgs, source, session.project, desc,
     )
 }
 
@@ -976,20 +971,16 @@ fn visible_sessions_for_view<'a>(
 }
 
 fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()> {
-    use skim::prelude::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::collections::HashMap;
 
-    // Build session lookup and children map once
     let session_by_id: HashMap<&str, &Session> =
         sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
 
-    // Navigation state - stack tracks drill-down history (empty = root view)
     let mut state = InteractiveState::default();
 
     loop {
-        // Build visible sessions based on search results or focus
-        // Search results take priority - they replace the view temporarily
         let focus = state.focus();
         let visible_sessions = visible_sessions_for_view(
             sessions,
@@ -998,14 +989,6 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             state.search_results(),
             focus,
         );
-
-        // Build display info
-        let mut session_info: HashMap<String, (bool, Option<&str>)> = HashMap::new();
-        for session in &visible_sessions {
-            let has_children = children_map.contains_key(&session.id);
-            let parent_id = session.forked_from.as_deref();
-            session_info.insert(session.id.clone(), (has_children, parent_id));
-        }
 
         let search_count = state.search_results().map(|r| r.len());
         let search_pattern = state.search_pattern().cloned();
@@ -1019,117 +1002,104 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         );
 
         let options = SkimOptionsBuilder::default()
-            .height(Some("100%"))
-            .preview(Some(""))
-            .preview_window(Some("right:50%:wrap"))
-            .header(Some(&header))
-            .prompt(Some("filter> "))
+            .height("100%")
+            .preview("") // enables preview pane
+            .preview_window("right:50%:wrap")
+            .header(&header)
+            .prompt("filter> ")
             .reverse(false)
-            .nosort(true)
+            .no_sort(true)
             .bind(vec![
-                "ctrl-s:accept", // transcript search
-                "right:accept",  // drill into subtree
-                "left:accept",   // go up to parent
+                "ctrl-s:accept".to_string(),
+                "right:accept".to_string(),
+                "left:accept".to_string(),
             ])
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
 
         let (tx, rx): (SkimItemSender, SkimItemReceiver) = unbounded();
 
-        for session in &visible_sessions {
-            let (has_children, _) = session_info.get(&session.id).unwrap_or(&(false, None));
-            let is_focus = focus.map(|f| f == &session.id).unwrap_or(false);
-            let prefix = if is_focus {
-                "▷ " // Hollow triangle for focused parent
-            } else if *has_children {
-                "▶ " // Filled triangle for items with children
-            } else {
-                "  " // No indicator for leaf nodes
-            };
-            let display = format_session_row_simple(prefix, session, debug);
-
-            let item = SessionItem {
-                filepath: session.filepath.clone(),
-                display,
-                match_text: format_session_desc(session, 100),
-                session_id: session.id.clone(),
-                search_pattern: search_pattern.clone(),
-            };
-            let _ = tx.send(Arc::new(item));
-        }
+        let items: Vec<Arc<dyn SkimItem>> = visible_sessions
+            .iter()
+            .map(|session| {
+                let is_focus = focus.map(|f| f == &session.id).unwrap_or(false);
+                let prefix = if is_focus {
+                    "▷ "
+                } else if children_map.contains_key(&session.id) {
+                    "▶ "
+                } else {
+                    "  "
+                };
+                Arc::new(SessionItem {
+                    filepath: session.filepath.clone(),
+                    display: format_session_row_simple(prefix, session, debug),
+                    session_id: session.id.clone(),
+                    search_pattern: search_pattern.clone(),
+                }) as Arc<dyn SkimItem>
+            })
+            .collect();
+        let _ = tx.send(items);
         drop(tx);
 
-        let output = Skim::run_with(&options, Some(rx));
+        let out =
+            Skim::run_with(options, Some(rx)).map_err(|e| anyhow::anyhow!("skim failed: {}", e))?;
 
-        match output {
-            Some(out) if out.is_abort => match state.apply(StateAction::Esc) {
-                StateEffect::Continue => continue,
+        if out.is_abort {
+            match state.apply(StateAction::Esc) {
                 StateEffect::Exit => return Ok(()),
                 _ => continue,
-            },
-            Some(out) => {
-                // ctrl+s triggers transcript search - replaces view with matching sessions
-                // Searches within the already-loaded session list (respects -r/-p filters)
-                if out.final_key == Key::Ctrl('s') {
-                    let effect = state.apply(StateAction::CtrlS {
-                        query: out.query.to_string(),
-                    });
-                    let StateEffect::RunSearch { pattern } = effect else {
-                        continue;
-                    };
-
-                    let pattern_lower = pattern.to_lowercase();
-                    let matched_ids: std::collections::HashSet<String> = sessions
-                        .iter()
-                        .filter(|s| s.search_text_lower.contains(&pattern_lower))
-                        .map(|s| s.id.clone())
-                        .collect();
-                    let _ = state.apply(StateAction::ApplySearchResults {
-                        pattern,
-                        matched_ids,
-                    });
-                    continue;
-                }
-
-                // Right: drill into subtree if session has children
-                if out.final_key == Key::Right {
-                    let selected_id = out
-                        .selected_items
-                        .first()
-                        .map(|item| item.output().to_string());
-                    let has_children = selected_id
-                        .as_ref()
-                        .and_then(|id| session_info.get(id))
-                        .map(|(has_children, _)| *has_children)
-                        .unwrap_or(false);
-                    let _ = state.apply(StateAction::Right {
-                        selected_id,
-                        has_children,
-                    });
-                    continue;
-                }
-
-                // Left: pop navigation stack (go back)
-                if out.final_key == Key::Left {
-                    let _ = state.apply(StateAction::Left);
-                    continue;
-                }
-
-                // Enter: select session
-                let selected_id = out
-                    .selected_items
-                    .first()
-                    .map(|item| item.output().to_string());
-                if let StateEffect::Select { session_id } =
-                    state.apply(StateAction::Enter { selected_id })
-                {
-                    if let Some(session) = session_by_id.get(session_id.as_str()) {
-                        resume_session(session, &session.filepath, fork)?;
-                        return Ok(());
-                    }
-                }
             }
-            None => return Ok(()),
+        }
+
+        let key = (out.final_key.code, out.final_key.modifiers);
+
+        if key == (KeyCode::Char('s'), KeyModifiers::CONTROL) {
+            let effect = state.apply(StateAction::CtrlS {
+                query: out.query.to_string(),
+            });
+            let StateEffect::RunSearch { pattern } = effect else {
+                continue;
+            };
+            let pattern_lower = pattern.to_lowercase();
+            let matched_ids: std::collections::HashSet<String> = sessions
+                .iter()
+                .filter(|s| s.search_text_lower.contains(&pattern_lower))
+                .map(|s| s.id.clone())
+                .collect();
+            let _ = state.apply(StateAction::ApplySearchResults {
+                pattern,
+                matched_ids,
+            });
+            continue;
+        }
+
+        if key.0 == KeyCode::Right {
+            let selected_id = out.selected_items.first().map(|m| m.output().to_string());
+            let has_children = selected_id
+                .as_ref()
+                .map(|id| children_map.contains_key(id))
+                .unwrap_or(false);
+            let _ = state.apply(StateAction::Right {
+                selected_id,
+                has_children,
+            });
+            continue;
+        }
+
+        // Left: pop stack
+        if key.0 == KeyCode::Left {
+            let _ = state.apply(StateAction::Left);
+            continue;
+        }
+
+        // Enter: select session
+        let selected_id = out.selected_items.first().map(|m| m.output().to_string());
+        if let StateEffect::Select { session_id } = state.apply(StateAction::Enter { selected_id })
+        {
+            if let Some(session) = session_by_id.get(session_id.as_str()) {
+                resume_session(session, &session.filepath, fork)?;
+                return Ok(());
+            }
         }
     }
 }
@@ -1138,18 +1108,13 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 struct SessionItem {
     filepath: PathBuf,
     display: String,
-    match_text: String,
     session_id: String,
     search_pattern: Option<String>, // When set, preview shows matching lines
 }
 
 impl SkimItem for SessionItem {
     fn text(&self) -> Cow<'_, str> {
-        Cow::Borrowed(&self.match_text)
-    }
-
-    fn display<'a>(&'a self, _context: DisplayContext<'a>) -> AnsiString<'a> {
-        AnsiString::parse(self.display.as_str())
+        Cow::Borrowed(&self.display)
     }
 
     fn output(&self) -> Cow<'_, str> {
@@ -1157,7 +1122,6 @@ impl SkimItem for SessionItem {
     }
 
     fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        // Generate preview content directly (no subprocess needed)
         let result = match &self.search_pattern {
             Some(pattern) => generate_search_preview(&self.filepath, pattern),
             None => generate_preview_content(&self.filepath),

@@ -259,7 +259,7 @@ The MSG column shows actual user turns, filtering out system-generated content:
 
 ## Dependencies
 
-- **Build**: Rust 1.85+ (edition 2024)
+- **Build**: Rust 1.86+ (edition 2024)
 - **Runtime**: None (skim is embedded, preview is self-contained)
 
 ### Key crates
