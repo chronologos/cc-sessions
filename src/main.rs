@@ -7,8 +7,8 @@ mod session;
 use anyhow::{Context, Result};
 use clap::Parser;
 use interactive_state::{Action as StateAction, Effect as StateEffect, InteractiveState};
-use skim::prelude::*;
 use session::{Session, SessionSource};
+use skim::prelude::*;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -26,7 +26,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // Mode
     // -------------------------------------------------------------------------
-
     /// List mode: print sessions as a table (no picker, no preview). Use without --list for interactive picker
     #[arg(long, help_heading = "Mode")]
     list: bool,
@@ -38,7 +37,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // Interactive-only (ignored with --list)
     // -------------------------------------------------------------------------
-
     /// Fork session instead of resuming (creates new session ID). Interactive only; ignored with --list
     #[arg(long, help_heading = "Interactive only")]
     fork: bool,
@@ -50,7 +48,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // List-only
     // -------------------------------------------------------------------------
-
     /// Include forked sessions in the table. List only (interactive mode shows forks via → navigation)
     #[arg(long, help_heading = "List only")]
     include_forks: bool,
@@ -58,7 +55,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // Filtering (both modes)
     // -------------------------------------------------------------------------
-
     /// Filter by project name (substring match, case-insensitive)
     #[arg(long, help_heading = "Filtering")]
     project: Option<String>,
@@ -74,7 +70,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // Remote sync
     // -------------------------------------------------------------------------
-
     /// Force sync all remotes before listing
     #[arg(long, help_heading = "Remote sync")]
     sync: bool,
@@ -94,7 +89,6 @@ struct Args {
     // -------------------------------------------------------------------------
     // Internal (hidden from --help)
     // -------------------------------------------------------------------------
-
     /// Preview a session file (used internally by interactive picker)
     #[arg(long, value_name = "FILE", hide = true)]
     preview: Option<PathBuf>,
@@ -247,7 +241,11 @@ fn print_sessions(sessions: &[&Session], count: usize, debug: bool) {
             let created = format_time_relative(session.created);
             let modified = format_time_relative(session.modified);
             let source = session.source.display_name();
-            let fork_indicator = if session.forked_from.is_some() { "↳" } else { "" };
+            let fork_indicator = if session.forked_from.is_some() {
+                "↳"
+            } else {
+                ""
+            };
             let id_short = if session.id.len() > 36 {
                 &session.id[..36]
             } else {
@@ -467,7 +465,9 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
                         let truncated = truncate_str(first_line, 120);
                         output.push_str(&format!(
                             "{}U: {}{}\n",
-                            colors::CYAN, truncated, colors::RESET
+                            colors::CYAN,
+                            truncated,
+                            colors::RESET
                         ));
                         line_count += 1;
                     }
@@ -479,7 +479,9 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
                     let truncated = truncate_str(first_line, 80);
                     output.push_str(&format!(
                         "{}A: {}{}\n",
-                        colors::YELLOW, truncated, colors::RESET
+                        colors::YELLOW,
+                        truncated,
+                        colors::RESET
                     ));
                     line_count += 1;
                 }
@@ -548,7 +550,9 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
 
     output.push_str(&format!(
         "{}Searching for: \"{}\"{}\n\n",
-        colors::GREEN, pattern, colors::RESET
+        colors::GREEN,
+        pattern,
+        colors::RESET
     ));
 
     // Find messages containing the pattern
@@ -566,7 +570,8 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         if match_count >= MAX_MATCHES {
             output.push_str(&format!(
                 "\n{}... more matches truncated{}\n",
-                colors::BOLD, colors::RESET
+                colors::BOLD,
+                colors::RESET
             ));
             break;
         }
@@ -580,7 +585,8 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         if match_count > 0 {
             output.push_str(&format!(
                 "\n{}════════════════════════════════{}\n\n",
-                colors::DIM, colors::RESET
+                colors::DIM,
+                colors::RESET
             ));
         }
 
@@ -612,7 +618,9 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
     } else {
         output.push_str(&format!(
             "\n\n{}{} matching messages{}",
-            colors::BOLD, match_count, colors::RESET
+            colors::BOLD,
+            match_count,
+            colors::RESET
         ));
     }
 
@@ -634,7 +642,10 @@ fn format_context_message(msg: &Message) -> String {
         };
         output.push_str(&format!(
             "{}{}{}{}\n",
-            colors::DIM, leader, line, colors::RESET
+            colors::DIM,
+            leader,
+            line,
+            colors::RESET
         ));
     }
     if lines.len() > MAX_CONTEXT_LINES {
@@ -673,7 +684,10 @@ fn format_matching_message(msg: &Message, pattern: &str) -> String {
         };
         output.push_str(&format!(
             "{}{}{}{}\n",
-            color, leader, formatted_line, colors::RESET
+            color,
+            leader,
+            formatted_line,
+            colors::RESET
         ));
     }
     output
@@ -767,8 +781,7 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
 
             // Invoke claude directly — no shell, no escaping needed
             let mut cmd = Command::new("claude");
-            cmd.current_dir(project_path)
-                .args(["-r", &session.id]);
+            cmd.current_dir(project_path).args(["-r", &session.id]);
             if fork {
                 cmd.arg("--fork-session");
             }
@@ -868,7 +881,10 @@ fn build_subtree_header(
 
     let status_line = match (search_pattern, search_count, fork) {
         (Some(pat), Some(count), true) => {
-            format!("FORK │ search: \"{}\" ({} matches) │ {}", pat, count, nav_hint)
+            format!(
+                "FORK │ search: \"{}\" ({} matches) │ {}",
+                pat, count, nav_hint
+            )
         }
         (Some(pat), Some(count), false) => {
             format!("search: \"{}\" ({} matches) │ {}", pat, count, nav_hint)
@@ -904,24 +920,14 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
 
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
-        prefix,
-        id_prefix,
-        created,
-        modified,
-        msgs,
-        source,
-        session.project,
-        desc_colored,
+        prefix, id_prefix, created, modified, msgs, source, session.project, desc_colored,
     )
 }
 
 /// Build column legend for interactive mode
 fn build_column_legend(debug: bool) -> String {
     let id_col = if debug { "ID    " } else { "" };
-    format!(
-        "  {}CRE  MOD  MSG SOURCE PROJECT      SUMMARY",
-        id_col
-    )
+    format!("  {}CRE  MOD  MSG SOURCE PROJECT      SUMMARY", id_col)
 }
 
 /// Compute visible sessions based on current search and subtree focus state.
@@ -965,11 +971,7 @@ fn visible_sessions_for_view<'a>(
         .collect()
 }
 
-fn interactive_mode(
-    sessions: &[Session],
-    fork: bool,
-    debug: bool,
-) -> Result<()> {
+fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()> {
     use skim::prelude::*;
     use std::collections::HashMap;
 
@@ -1004,8 +1006,14 @@ fn interactive_mode(
 
         let search_count = state.search_results().map(|r| r.len());
         let search_pattern = state.search_pattern().cloned();
-        let header =
-            build_subtree_header(&search_pattern, search_count, fork, focus, &session_by_id, debug);
+        let header = build_subtree_header(
+            &search_pattern,
+            search_count,
+            fork,
+            focus,
+            &session_by_id,
+            debug,
+        );
 
         let options = SkimOptionsBuilder::default()
             .height(Some("100%"))
@@ -1051,13 +1059,11 @@ fn interactive_mode(
         let output = Skim::run_with(&options, Some(rx));
 
         match output {
-            Some(out) if out.is_abort => {
-                match state.apply(StateAction::Esc) {
-                    StateEffect::Continue => continue,
-                    StateEffect::Exit => return Ok(()),
-                    _ => continue,
-                }
-            }
+            Some(out) if out.is_abort => match state.apply(StateAction::Esc) {
+                StateEffect::Continue => continue,
+                StateEffect::Exit => return Ok(()),
+                _ => continue,
+            },
             Some(out) => {
                 // ctrl+s triggers transcript search - replaces view with matching sessions
                 // Searches within the already-loaded session list (respects -r/-p filters)
@@ -1073,7 +1079,12 @@ fn interactive_mode(
                     let index = search_text_index.get_or_insert_with(|| {
                         sessions
                             .iter()
-                            .map(|s| (s.id.clone(), claude_code::session_search_text_lower(&s.filepath)))
+                            .map(|s| {
+                                (
+                                    s.id.clone(),
+                                    claude_code::session_search_text_lower(&s.filepath),
+                                )
+                            })
                             .collect()
                     });
                     let matched_ids: std::collections::HashSet<String> = index
@@ -1090,7 +1101,10 @@ fn interactive_mode(
 
                 // Right: drill into subtree if session has children
                 if out.final_key == Key::Right {
-                    let selected_id = out.selected_items.first().map(|item| item.output().to_string());
+                    let selected_id = out
+                        .selected_items
+                        .first()
+                        .map(|item| item.output().to_string());
                     let has_children = selected_id
                         .as_ref()
                         .and_then(|id| session_info.get(id))
@@ -1110,8 +1124,13 @@ fn interactive_mode(
                 }
 
                 // Enter: select session
-                let selected_id = out.selected_items.first().map(|item| item.output().to_string());
-                if let StateEffect::Select { session_id } = state.apply(StateAction::Enter { selected_id }) {
+                let selected_id = out
+                    .selected_items
+                    .first()
+                    .map(|item| item.output().to_string());
+                if let StateEffect::Select { session_id } =
+                    state.apply(StateAction::Enter { selected_id })
+                {
                     if let Some(session) = session_by_id.get(session_id.as_str()) {
                         resume_session(session, &session.filepath, fork)?;
                         return Ok(());
@@ -1403,8 +1422,14 @@ mod tests {
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
         // Search with match count
-        let header =
-            build_subtree_header(&Some("api".to_string()), Some(5), false, None, &session_by_id, false);
+        let header = build_subtree_header(
+            &Some("api".to_string()),
+            Some(5),
+            false,
+            None,
+            &session_by_id,
+            false,
+        );
         assert!(header.contains("search: \"api\""));
         assert!(header.contains("(5 matches)"));
         assert!(header.contains("esc to clear"));

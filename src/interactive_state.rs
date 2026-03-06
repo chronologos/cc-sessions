@@ -10,14 +10,21 @@ pub struct InteractiveState {
 #[derive(Debug)]
 pub enum Action {
     Esc,
-    CtrlS { query: String },
-    ApplySearchResults { pattern: String, matched_ids: HashSet<String> },
+    CtrlS {
+        query: String,
+    },
+    ApplySearchResults {
+        pattern: String,
+        matched_ids: HashSet<String>,
+    },
     Right {
         selected_id: Option<String>,
         has_children: bool,
     },
     Left,
-    Enter { selected_id: Option<String> },
+    Enter {
+        selected_id: Option<String>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,7 +94,11 @@ impl InteractiveState {
                     return Effect::Continue;
                 };
 
-                let already_focused = self.focus_stack.last().map(|f| f == &selected_id).unwrap_or(false);
+                let already_focused = self
+                    .focus_stack
+                    .last()
+                    .map(|f| f == &selected_id)
+                    .unwrap_or(false);
                 if has_children && !already_focused {
                     self.focus_stack.push(selected_id);
                 }

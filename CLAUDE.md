@@ -84,12 +84,9 @@ All metadata is extracted directly from `.jsonl` files (no index dependency):
 
 1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
 2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
-3. **Extract** metadata via scan + tail:
-   - **Single-pass scan**: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text
-   - **TAIL** (last ~16KB): `summary` type entry
-   - **Grep entire file**: `custom-title` entry
+3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text, last `summary` entry, last `custom-title` entry, `isSidechain` flag
 4. **Timestamps** from filesystem (created, modified)
-5. **Filter out** empty sessions (no cwd, no user message, no summary)
+5. **Filter out** sidechain sessions and empty sessions (no cwd, no user message, no summary)
 
 Uses `rayon` for parallel processing across files.
 
@@ -103,17 +100,19 @@ This filters out:
 
 ### Metadata Extraction
 
-| Field | Source | Location |
-|-------|--------|----------|
-| `project_path` | `cwd` field | File head |
-| `first_message` | First `user` entry | File head |
-| `forked_from` | `forkedFrom.sessionId` field | File head |
-| `summary` | `summary` type entry | File tail (16KB) |
-| `name` (customTitle) | `custom-title` entry | Grep entire file |
-| `created` | Filesystem | `metadata.created()` |
-| `modified` | Filesystem | `metadata.modified()` |
+All fields come from a single full-file pass (one open, one `BufReader` scan):
 
-**Why grep for customTitle?** The `/rename` command can be invoked at any point in a session, so `custom-title` entries can appear anywhere in the file, not just the tail.
+| Field | Source | Selection |
+|-------|--------|-----------|
+| `project_path` | `cwd` field | First occurrence |
+| `first_message` | First `user` entry passing filters | First occurrence |
+| `forked_from` | `forkedFrom.sessionId` field | First occurrence |
+| `summary` | `summary` type entry | Last well-formed occurrence |
+| `name` (customTitle) | `custom-title` type entry | Last well-formed occurrence |
+| `is_sidechain` | `isSidechain:true` on any entry | Early return on match |
+| `created` / `modified` | Filesystem | `metadata.created()` / `.modified()` |
+
+Summary and custom-title entries can appear anywhere (compaction mid-session, `/rename` at any point), so last-wins is the correct semantic.
 
 ### Session Names (customTitle)
 - Set via `/rename` command in Claude Code
@@ -263,6 +262,5 @@ The MSG column shows actual user turns, filtering out system content:
 |-------|---------|
 | `skim` | Embedded fuzzy finder (replaces fzf) |
 | `rayon` | Parallel file processing |
-| `grep-regex`, `grep-searcher` | Fast pattern matching for customTitle |
 | `serde_json` | JSONL parsing |
 | `clap` | CLI argument parsing |

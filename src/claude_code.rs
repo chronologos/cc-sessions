@@ -19,15 +19,12 @@
 //! Metadata is extracted directly from file contents (head + tail) rather than
 //! relying on `sessions-index.json` which is often stale.
 
-use crate::session::{Session, SessionSource};
 use crate::message_classification::{counts_as_turn, is_first_prompt_candidate};
+use crate::session::{Session, SessionSource};
 use anyhow::{Context, Result};
-use grep_regex::RegexMatcher;
-use grep_searcher::Searcher;
-use grep_searcher::sinks::UTF8;
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -196,12 +193,7 @@ fn is_valid_session_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract all session metadata from a .jsonl file.
-///
-/// Reads:
-/// - HEAD (first ~50 lines): cwd, first user message, forkedFrom
-/// - TAIL (last ~16KB): summary type entry, customTitle field
-/// - Filesystem: created/modified timestamps
+/// Extract all session metadata from a .jsonl file in a single pass.
 fn extract_session_metadata(
     filepath: &Path,
     parent_dir_name: &str,
@@ -209,126 +201,125 @@ fn extract_session_metadata(
 ) -> Option<Session> {
     let id = filepath.file_stem()?.to_string_lossy().to_string();
 
-    // Get timestamps from file metadata
     let metadata = fs::metadata(filepath).ok()?;
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     let created = metadata.created().unwrap_or(modified);
 
-    // Extract metadata + turns in a single file pass
-    let scan = scan_head_turns_and_search(filepath);
-    let head = scan.head;
+    let scan = scan_session_file(filepath);
 
-    // Extract metadata from file tail (summary, customTitle)
-    let (summary, custom_title) = read_file_tail(filepath);
-
-    let turn_count = scan.turn_count;
-
-    // Skip "empty" sessions that have no user content
-    if head.project_path.is_empty() && head.first_prompt.is_none() && summary.is_none() {
+    // Task-spawned subagent sessions land in the main project dir with this flag set.
+    if scan.is_sidechain {
         return None;
     }
 
-    let project = extract_project_name(&head.project_path, parent_dir_name);
+    // Skip "empty" sessions that have no user content
+    if scan.project_path.is_empty() && scan.first_prompt.is_none() && scan.summary.is_none() {
+        return None;
+    }
+
+    let project = extract_project_name(&scan.project_path, parent_dir_name);
 
     Some(Session {
         id,
         project,
-        project_path: head.project_path,
+        project_path: scan.project_path,
         filepath: filepath.to_path_buf(),
         created,
         modified,
-        first_message: head.first_prompt,
-        summary,
-        name: custom_title,
-        turn_count,
+        first_message: scan.first_prompt,
+        summary: scan.summary,
+        name: scan.custom_title,
+        turn_count: scan.turn_count,
         source,
-        forked_from: head.forked_from,
+        forked_from: scan.forked_from,
     })
 }
 
-/// Metadata extracted from session file head
+/// Output of single-pass scan over a session file.
 #[derive(Default)]
-struct HeadMetadata {
+struct SessionScan {
     project_path: String,
     first_prompt: Option<String>,
     forked_from: Option<String>,
-}
-
-/// Output of single-pass scan over a session file.
-struct HeadTurnSearchScan {
-    head: HeadMetadata,
     turn_count: usize,
     search_text_lower: String,
+    summary: Option<String>,
+    custom_title: Option<String>,
+    is_sidechain: bool,
 }
 
-/// Scan a session file once to collect:
-/// - head metadata (cwd, first prompt, forkedFrom)
-/// - user turn count
-/// - lowercase searchable transcript text (user + assistant)
-fn scan_head_turns_and_search(filepath: &Path) -> HeadTurnSearchScan {
-    let mut head = HeadMetadata::default();
-    let mut turn_count = 0;
+/// Scan a session file once to collect all metadata, turn count, and search text.
+///
+/// Single file open, single pass. Summary and custom-title entries can appear
+/// anywhere (compaction, /rename mid-session); last well-formed occurrence wins.
+fn scan_session_file(filepath: &Path) -> SessionScan {
+    let mut scan = SessionScan::default();
     let mut search_chunks = Vec::new();
 
     let Ok(file) = File::open(filepath) else {
-        return HeadTurnSearchScan {
-            head,
-            turn_count,
-            search_text_lower: String::new(),
-        };
+        return scan;
     };
 
-    let reader = BufReader::new(file);
-
-    for line in reader.lines().map_while(Result::ok) {
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
+        // Sidechain sessions are subagent transcripts — bail immediately,
+        // they can be large and we're going to discard them anyway.
+        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            scan.is_sidechain = true;
+            return scan;
+        }
+
         let entry_type = entry.get("type").and_then(|v| v.as_str());
 
-        // Head metadata: cwd
-        if head.project_path.is_empty() {
+        match entry_type {
+            Some("summary") => {
+                if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
+                    scan.summary = Some(s.to_string());
+                }
+                continue;
+            }
+            Some("custom-title") => {
+                if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
+                    scan.custom_title = Some(t.to_string());
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        if scan.project_path.is_empty() {
             if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
-                head.project_path = cwd.to_string();
+                scan.project_path = cwd.to_string();
             }
         }
 
-        // Head metadata: fork parent
-        if head.forked_from.is_none() {
+        if scan.forked_from.is_none() {
             if let Some(parent_id) = entry
                 .get("forkedFrom")
                 .and_then(|f| f.get("sessionId"))
                 .and_then(|v| v.as_str())
             {
-                head.forked_from = Some(parent_id.to_string());
+                scan.forked_from = Some(parent_id.to_string());
             }
         }
 
-        // Head metadata: first user prompt
-        if head.first_prompt.is_none() && entry_type == Some("user") {
-            if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
-                if let Some(text) = extract_text_content(content) {
-                    if is_first_prompt_candidate(&text) {
-                        head.first_prompt = Some(crate::normalize_summary(&text, 50));
-                    }
-                }
-            }
-        }
-
-        // Turn counting
         if entry_type == Some("user") {
             if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
                 if let Some(text) = extract_text_content(content) {
+                    if scan.first_prompt.is_none() && is_first_prompt_candidate(&text) {
+                        scan.first_prompt = Some(crate::normalize_summary(&text, 50));
+                    }
                     if counts_as_turn(&text) {
-                        turn_count += 1;
+                        scan.turn_count += 1;
                     }
                 }
             }
         }
 
-        // Search text (user + assistant, all text blocks)
         if matches!(entry_type, Some("user") | Some("assistant")) {
             if let Some(text) = extract_message_text_for_search(&entry) {
                 if !text.is_empty() {
@@ -338,109 +329,13 @@ fn scan_head_turns_and_search(filepath: &Path) -> HeadTurnSearchScan {
         }
     }
 
-    HeadTurnSearchScan {
-        head,
-        turn_count,
-        search_text_lower: search_chunks.join("\n").to_lowercase(),
-    }
-}
-
-/// Read the head of a session file to extract cwd, first user message, and fork parent
-#[cfg(test)]
-fn read_file_head(filepath: &Path) -> HeadMetadata {
-    scan_head_turns_and_search(filepath).head
-}
-
-/// Read the tail of a session file to extract summary and customTitle
-///
-/// Strategy:
-/// - Summary: Read last 16KB (summaries are always at end of compacted sessions)
-/// - CustomTitle: Use grep to find `custom-title` type entry anywhere in file
-fn read_file_tail(filepath: &Path) -> (Option<String>, Option<String>) {
-    let summary = read_summary_from_tail(filepath);
-    let custom_title = find_custom_title(filepath);
-    (summary, custom_title)
-}
-
-/// Count conversation turns (real user messages) in a session file.
-///
-/// Only counts entries where:
-/// - type == "user"
-/// - message.content exists and is not system content (starts with <, [, or /)
-#[cfg(test)]
-fn count_turns(filepath: &Path) -> usize {
-    scan_head_turns_and_search(filepath).turn_count
+    scan.search_text_lower = search_chunks.join("\n").to_lowercase();
+    scan
 }
 
 /// Build lowercase searchable transcript text for user/assistant messages.
 pub fn session_search_text_lower(filepath: &Path) -> String {
-    scan_head_turns_and_search(filepath).search_text_lower
-}
-
-/// Read summary from the tail of the file (last 16KB)
-fn read_summary_from_tail(filepath: &Path) -> Option<String> {
-    const TAIL_SIZE: u64 = 16 * 1024; // 16KB
-
-    let mut file = File::open(filepath).ok()?;
-    let len = file.metadata().ok()?.len();
-
-    // Seek to tail
-    let start = len.saturating_sub(TAIL_SIZE);
-    if start > 0 {
-        file.seek(SeekFrom::Start(start)).ok()?;
-    }
-
-    let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
-
-    // If we seeked mid-file, skip first partial line
-    if start > 0 {
-        if let Some(newline) = content.find('\n') {
-            content = content[newline + 1..].to_string();
-        }
-    }
-
-    // Find summary type entry
-    for line in content.lines() {
-        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-            if entry.get("type").and_then(|v| v.as_str()) == Some("summary") {
-                return entry
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
-    }
-
-    None
-}
-
-/// Find customTitle by grepping the file for "custom-title" type entry
-///
-/// CustomTitle can appear anywhere in the file (when user runs /rename),
-/// so we use grep to efficiently locate it rather than reading the whole file.
-/// Returns the LAST match since users may rename multiple times.
-fn find_custom_title(filepath: &Path) -> Option<String> {
-    // Use grep to find custom-title lines efficiently
-    let matcher = RegexMatcher::new_line_matcher(r#""type"\s*:\s*"custom-title""#).ok()?;
-    let mut found_line = None;
-
-    let _ = Searcher::new().search_path(
-        &matcher,
-        filepath,
-        UTF8(|_, line| {
-            found_line = Some(line.to_string());
-            Ok(true) // Continue to find the last match (most recent rename)
-        }),
-    );
-
-    // Parse the found line to extract customTitle
-    let line = found_line?;
-    let entry: serde_json::Value = serde_json::from_str(&line).ok()?;
-    entry
-        .get("customTitle")
-        .and_then(|v| v.as_str())
-        .map(String::from)
+    scan_session_file(filepath).search_text_lower
 }
 
 /// Extract first text from message content (string or array of content blocks).
@@ -712,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn find_sessions_extracts_custom_title_from_tail() {
+    fn find_sessions_extracts_custom_title() {
         let temp_dir =
             std::env::temp_dir().join(format!("cc-session-test-title-{}", std::process::id()));
         let project_dir = temp_dir.join("-Users-brian-life");
@@ -863,9 +758,9 @@ mod tests {
     }
 
     #[test]
-    fn read_file_head_prefers_first_forked_from() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-fork-order-{}", std::process::id()));
+    fn scan_prefers_first_forked_from() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-fork-order-{}", std::process::id()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -877,18 +772,16 @@ mod tests {
         )
         .unwrap();
 
-        let head = read_file_head(&session_path);
-        assert_eq!(head.forked_from, Some("parent-1".to_string()));
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.forked_from, Some("parent-1".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
-    fn read_file_head_extracts_forked_from_early() {
-        // Test that forkedFrom is extracted even if it appears on a later entry
-        // (not just the first line)
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-fork-pos-{}", std::process::id()));
+    fn scan_extracts_forked_from_on_later_line() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-fork-pos-{}", std::process::id()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -901,11 +794,11 @@ mod tests {
         )
         .unwrap();
 
-        let head = read_file_head(&session_path);
+        let scan = scan_session_file(&session_path);
 
-        assert_eq!(head.project_path, "/Users/test/project");
-        assert_eq!(head.forked_from, Some("parent-session-id".to_string()));
-        assert_eq!(head.first_prompt, Some("hello".to_string()));
+        assert_eq!(scan.project_path, "/Users/test/project");
+        assert_eq!(scan.forked_from, Some("parent-session-id".to_string()));
+        assert_eq!(scan.first_prompt, Some("hello".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
@@ -930,16 +823,15 @@ mod tests {
         )
         .unwrap();
 
-        let count = count_turns(&session_path);
-        assert_eq!(count, 2); // Two real user messages
+        assert_eq!(scan_session_file(&session_path).turn_count, 2); // Two real user messages
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn count_turns_excludes_system_content() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-turns-sys-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-turns-sys-{}", std::process::id()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -954,16 +846,17 @@ mod tests {
         )
         .unwrap();
 
-        let count = count_turns(&session_path);
-        assert_eq!(count, 2); // Only "Real message here" and "Another real message"
+        assert_eq!(scan_session_file(&session_path).turn_count, 2); // Only "Real message here" and "Another real message"
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn count_turns_handles_content_blocks() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-turns-blocks-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-turns-blocks-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -976,31 +869,33 @@ mod tests {
         )
         .unwrap();
 
-        let count = count_turns(&session_path);
-        assert_eq!(count, 2); // "Hello from blocks" and "Real question?"
+        assert_eq!(scan_session_file(&session_path).turn_count, 2); // "Hello from blocks" and "Real question?"
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn count_turns_empty_file() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-turns-empty-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-turns-empty-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
         fs::write(&session_path, "").unwrap();
 
-        let count = count_turns(&session_path);
-        assert_eq!(count, 0);
+        assert_eq!(scan_session_file(&session_path).turn_count, 0);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
     fn first_prompt_and_turn_count_current_filter_behavior() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-first-prompt-turns-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-first-prompt-turns-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -1011,16 +906,15 @@ mod tests {
         )
         .unwrap();
 
-        let head = read_file_head(&session_path);
-        let count = count_turns(&session_path);
+        let scan = scan_session_file(&session_path);
 
         // Characterization: first prompt currently excludes [Request... but not all bracketed text.
         assert_eq!(
-            head.first_prompt,
+            scan.first_prompt,
             Some("[tool output that is not Request]".to_string())
         );
         // Characterization: turn counting excludes all bracketed entries.
-        assert_eq!(count, 1);
+        assert_eq!(scan.turn_count, 1);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
@@ -1061,8 +955,8 @@ mod tests {
 
     #[test]
     fn scan_once_produces_equivalent_session_metadata() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-scan-once-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-scan-once-{}", std::process::id()));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
@@ -1070,24 +964,141 @@ mod tests {
             &session_path,
             r#"{"type":"user","message":{"role":"user","content":"Real prompt"},"cwd":"/Users/test/project"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"assistant reply"}]}}
-{"type":"user","message":{"role":"user","content":"/help"}
+{"type":"user","message":{"role":"user","content":"/help"}}
 {"type":"user","message":{"role":"user","content":"Second real prompt"}}"#,
         )
         .unwrap();
 
-        let scan = scan_head_turns_and_search(&session_path);
+        let scan = scan_session_file(&session_path);
 
-        assert_eq!(scan.head.project_path, "/Users/test/project");
-        assert_eq!(scan.head.first_prompt, Some("Real prompt".to_string()));
+        assert_eq!(scan.project_path, "/Users/test/project");
+        assert_eq!(scan.first_prompt, Some("Real prompt".to_string()));
         assert_eq!(scan.turn_count, 2);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
+    fn scan_filters_sidechain_sessions() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-sidechain-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-test-proj");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid = test_uuid(50);
+        let session_path = project_dir.join(format!("{}.jsonl", uuid));
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"agent work"},"cwd":"/Users/test/proj","isSidechain":true}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert!(scan.is_sidechain);
+
+        let sessions = find_sessions(&temp_dir).unwrap();
+        assert_eq!(sessions.len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_ignores_sidechain_false() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-sidechain-false-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"hi"},"cwd":"/tmp","isSidechain":false}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert!(!scan.is_sidechain);
+        assert_eq!(scan.project_path, "/tmp");
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_takes_last_summary() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-multi-summary-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"summary","summary":"Early compaction"}
+{"type":"user","message":{"role":"user","content":"more work"},"cwd":"/tmp"}
+{"type":"summary","summary":"Final summary"}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.summary, Some("Final summary".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_keeps_valid_summary_when_later_entry_malformed() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-summary-malformed-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"summary","summary":"Valid"}
+{"type":"summary"}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.summary, Some("Valid".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_takes_last_custom_title() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-rename-twice-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"hello"},"cwd":"/tmp"}
+{"type":"custom-title","customTitle":"Old Name","sessionId":"x"}
+{"type":"assistant","message":{"role":"assistant","content":"hi"}}
+{"type":"custom-title","customTitle":"New Name","sessionId":"x"}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.custom_title, Some("New Name".to_string()));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
     fn session_search_text_lower_includes_user_and_assistant_text() {
-        let temp_dir = std::env::temp_dir()
-            .join(format!("cc-session-test-search-text-{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-search-text-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&temp_dir).unwrap();
 
         let session_path = temp_dir.join("test.jsonl");
