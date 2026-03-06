@@ -176,21 +176,18 @@ fn is_valid_session_uuid(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
-/// Check if a path is a valid session file (UUID.jsonl, not in subagents/)
+/// Check if a path is a valid session file (UUID-named .jsonl).
+///
+/// UUID validation alone excludes subagent transcripts: those are named
+/// `agent-{hex}.jsonl` and live in `{session}/subagents/` (depth 3, which
+/// the WalkDir depth-2 cap doesn't traverse anyway).
 fn is_valid_session_file(path: &Path) -> bool {
-    // Must be .jsonl file
-    if path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
-        return false;
-    }
-    // Skip subagents directory
-    if path.to_string_lossy().contains("/subagents/") {
-        return false;
-    }
-    // Must have valid UUID filename
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .map(is_valid_session_uuid)
-        .unwrap_or(false)
+    path.extension() == Some(std::ffi::OsStr::new("jsonl"))
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(is_valid_session_uuid)
+            .unwrap_or(false)
 }
 
 /// Extract all session metadata from a .jsonl file in a single pass.
@@ -207,8 +204,7 @@ fn extract_session_metadata(
 
     let scan = scan_session_file(filepath);
 
-    // Task-spawned subagent sessions land in the main project dir with this flag set.
-    if scan.is_sidechain {
+    if scan.skip {
         return None;
     }
 
@@ -245,7 +241,8 @@ struct SessionScan {
     search_text_lower: String,
     summary: Option<String>,
     custom_title: Option<String>,
-    is_sidechain: bool,
+    /// Session should be excluded from the picker (sidechain or swarm-teammate).
+    skip: bool,
 }
 
 /// Scan a session file once to collect all metadata, turn count, and search text.
@@ -266,10 +263,13 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             Err(_) => continue,
         };
 
-        // Sidechain sessions are subagent transcripts — bail immediately,
-        // they can be large and we're going to discard them anyway.
-        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
-            scan.is_sidechain = true;
+        // Sidechain (subagent) and teammate (swarm) sessions can both land in
+        // the main project dir as UUID-named files. Bail early — they can be
+        // large and we're discarding them anyway.
+        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+            || entry.get("teamName").and_then(|v| v.as_str()).is_some()
+        {
+            scan.skip = true;
             return scan;
         }
 
@@ -305,6 +305,15 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             {
                 scan.forked_from = Some(parent_id.to_string());
             }
+        }
+
+        // isMeta/isCompactSummary mark synthetic user messages (attachment
+        // context, post-compaction summaries). They carry cwd/forkedFrom like
+        // any entry, but their content is never real user input.
+        if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            || entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
+        {
+            continue;
         }
 
         if entry_type == Some("user") {
@@ -994,7 +1003,7 @@ mod tests {
         .unwrap();
 
         let scan = scan_session_file(&session_path);
-        assert!(scan.is_sidechain);
+        assert!(scan.skip);
 
         let sessions = find_sessions(&temp_dir).unwrap();
         assert_eq!(sessions.len(), 0);
@@ -1018,8 +1027,75 @@ mod tests {
         .unwrap();
 
         let scan = scan_session_file(&session_path);
-        assert!(!scan.is_sidechain);
+        assert!(!scan.skip);
         assert_eq!(scan.project_path, "/tmp");
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_filters_teammate_sessions() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-teammate-{}", std::process::id()));
+        let project_dir = temp_dir.join("-Users-test-proj");
+        fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid = test_uuid(51);
+        let session_path = project_dir.join(format!("{}.jsonl", uuid));
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"swarm work"},"cwd":"/tmp","teamName":"my-team","isSidechain":false}"#,
+        )
+        .unwrap();
+
+        assert!(scan_session_file(&session_path).skip);
+        assert_eq!(find_sessions(&temp_dir).unwrap().len(), 0);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_skips_meta_entries_for_first_prompt_and_turns() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-meta-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"synthetic attachment context"},"cwd":"/tmp","isMeta":true}
+{"type":"user","message":{"role":"user","content":"real user prompt"}}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.project_path, "/tmp"); // cwd still extracted from meta entry
+        assert_eq!(scan.first_prompt, Some("real user prompt".to_string()));
+        assert_eq!(scan.turn_count, 1);
+        assert!(!scan.search_text_lower.contains("synthetic"));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_skips_compact_summary_entries() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "cc-session-test-compact-summary-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"user","message":{"role":"user","content":"This session covers X and Y"},"cwd":"/tmp","isCompactSummary":true}
+{"type":"user","message":{"role":"user","content":"actual question"}}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.first_prompt, Some("actual question".to_string()));
+        assert_eq!(scan.turn_count, 1);
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }

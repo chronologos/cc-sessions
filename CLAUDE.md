@@ -84,9 +84,9 @@ All metadata is extracted directly from `.jsonl` files (no index dependency):
 
 1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
 2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
-3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text, last `summary` entry, last `custom-title` entry, `isSidechain` flag
+3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text, last `summary` entry, last `custom-title` entry, skip flags
 4. **Timestamps** from filesystem (created, modified)
-5. **Filter out** sidechain sessions and empty sessions (no cwd, no user message, no summary)
+5. **Filter out** sidechain/teammate sessions and empty sessions (no cwd, no user message, no summary)
 
 Uses `rayon` for parallel processing across files.
 
@@ -109,10 +109,14 @@ All fields come from a single full-file pass (one open, one `BufReader` scan):
 | `forked_from` | `forkedFrom.sessionId` field | First occurrence |
 | `summary` | `summary` type entry | Last well-formed occurrence |
 | `name` (customTitle) | `custom-title` type entry | Last well-formed occurrence |
-| `is_sidechain` | `isSidechain:true` on any entry | Early return on match |
+| `skip` | `isSidechain:true` or `teamName` present | Early return on match |
 | `created` / `modified` | Filesystem | `metadata.created()` / `.modified()` |
 
 Summary and custom-title entries can appear anywhere (compaction mid-session, `/rename` at any point), so last-wins is the correct semantic.
+
+**Entry-level skips** (processed for `cwd`/`forkedFrom` but excluded from first-prompt, turn count, and search text):
+- `isMeta:true` — synthetic messages (attachment context, proactive ticks)
+- `isCompactSummary:true` — post-compaction summary text
 
 ### Session Names (customTitle)
 - Set via `/rename` command in Claude Code
