@@ -322,36 +322,40 @@ fn format_time_relative(time: SystemTime) -> String {
     }
 }
 
-/// Format session description: show name (★) if present, otherwise summary/first_message
+/// Format session description: name (★) > tag (#) > summary > first_message
 fn format_session_desc(session: &Session, max_chars: usize) -> String {
-    // Named sessions show ★ prefix with name, then summary if space allows
-    if let Some(ref name) = session.name {
-        let prefix = format!("★ {}", name);
-        let prefix_len = prefix.chars().count();
+    let label = match (&session.name, &session.tag) {
+        (Some(name), Some(tag)) => Some(format!("★ {} #{}", name, tag)),
+        (Some(name), None) => Some(format!("★ {}", name)),
+        (None, Some(tag)) => Some(format!("#{}", tag)),
+        (None, None) => None,
+    };
 
-        if prefix_len >= max_chars {
-            return prefix.chars().take(max_chars).collect();
+    if let Some(label) = label {
+        let label_len = label.chars().count();
+        if label_len >= max_chars {
+            return label.chars().take(max_chars).collect();
         }
-
-        // Append summary if there's enough room
-        match &session.summary {
-            Some(summary) if max_chars > prefix_len + 13 => {
-                // " - " + at least 10 chars
-                let remaining = max_chars - prefix_len - 3;
-                let summary_truncated: String = summary.chars().take(remaining).collect();
-                format!("{} - {}", prefix, summary_truncated)
+        // Append summary if there's room for " - " + at least 10 chars
+        if let Some(summary) = &session.summary {
+            if max_chars > label_len + 13 {
+                let remaining = max_chars - label_len - 3;
+                return format!(
+                    "{} - {}",
+                    label,
+                    summary.chars().take(remaining).collect::<String>()
+                );
             }
-            _ => prefix,
         }
-    } else {
-        // No name - use summary or first_message
-        session
-            .summary
-            .as_deref()
-            .or(session.first_message.as_deref())
-            .map(|s| s.chars().take(max_chars).collect())
-            .unwrap_or_default()
+        return label;
     }
+
+    session
+        .summary
+        .as_deref()
+        .or(session.first_message.as_deref())
+        .map(|s| s.chars().take(max_chars).collect())
+        .unwrap_or_default()
 }
 
 fn filter_forks_for_list(sessions: &[Session], include_forks: bool) -> Vec<&Session> {
@@ -982,7 +986,6 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 
     // Navigation state - stack tracks drill-down history (empty = root view)
     let mut state = InteractiveState::default();
-    let mut search_text_index: Option<HashMap<String, String>> = None;
 
     loop {
         // Build visible sessions based on search results or focus
@@ -1076,21 +1079,10 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     };
 
                     let pattern_lower = pattern.to_lowercase();
-                    let index = search_text_index.get_or_insert_with(|| {
-                        sessions
-                            .iter()
-                            .map(|s| {
-                                (
-                                    s.id.clone(),
-                                    claude_code::session_search_text_lower(&s.filepath),
-                                )
-                            })
-                            .collect()
-                    });
-                    let matched_ids: std::collections::HashSet<String> = index
+                    let matched_ids: std::collections::HashSet<String> = sessions
                         .iter()
-                        .filter(|(_, text)| text.contains(&pattern_lower))
-                        .map(|(id, _)| id.clone())
+                        .filter(|s| s.search_text_lower.contains(&pattern_lower))
+                        .map(|s| s.id.clone())
                         .collect();
                     let _ = state.apply(StateAction::ApplySearchResults {
                         pattern,
@@ -1320,9 +1312,11 @@ mod tests {
             first_message: None,
             summary: Some("test summary".to_string()),
             name: None,
+            tag: None,
             turn_count: 1,
             source: SessionSource::Local,
             forked_from: None,
+            search_text_lower: String::new(),
         }
     }
 

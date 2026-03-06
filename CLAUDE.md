@@ -109,6 +109,7 @@ All fields come from a single full-file pass (one open, one `BufReader` scan):
 | `forked_from` | `forkedFrom.sessionId` field | First occurrence |
 | `summary` | `summary` type entry | Last well-formed occurrence |
 | `name` (customTitle) | `custom-title` type entry | Last well-formed occurrence |
+| `tag` | `tag` type entry | Last occurrence; empty string clears |
 | `skip` | `isSidechain:true` or `teamName` present | Early return on match |
 | `created` / `modified` | Filesystem | `metadata.created()` / `.modified()` |
 
@@ -211,7 +212,7 @@ Ctrl+S performs literal full-text search across session transcripts and **replac
 
 **Design choice**: Search replaces the view temporarily rather than filtering within the current subtree. This ensures you can find any session regardless of navigation state. The search results persist until explicitly cleared with Esc.
 
-**Performance note**: The first Ctrl+S in a picker session builds an in-memory lowercase transcript index for loaded sessions; subsequent Ctrl+S queries reuse that index.
+**Performance note**: Lowercase transcript text is built during discovery and stored on each `Session`, so Ctrl+S is a simple in-memory filter with no additional I/O.
 
 ```
 Normal View                  After Ctrl+S "api"
@@ -242,14 +243,15 @@ Interactive mode displays a header with column legend:
 | MSG | Turn count (user messages, excludes system content) |
 | SOURCE | Session source (local, remote) |
 | PROJECT | Project directory name |
-| SUMMARY | AI-generated summary or custom title |
+| SUMMARY | `★ name` > `#tag` > summary > first message |
 
 #### Turn Counting
 
-The MSG column shows actual user turns, filtering out system content:
-- Excludes `<command-...>` tags (hook output)
-- Excludes `[...]` bracketed content (local tool output)
-- Excludes `/...` commands (slash commands)
+The MSG column shows actual user turns, filtering out system-generated content:
+- Entries with `isMeta:true` or `isCompactSummary:true`
+- Known system tag prefixes (`<command-...>`, `<local-command-...>`, `<bash-...>`, `<ide_...>`, `<tick>`, etc.) — but NOT arbitrary `<text>` like `<Button>`
+- `[...]` bracketed content
+- `/...` slash commands
 
 #### Debug Mode
 

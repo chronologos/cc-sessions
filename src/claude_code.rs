@@ -16,8 +16,7 @@
 //! ```
 //!
 //! Sessions are discovered by scanning for `.jsonl` files with valid UUID filenames.
-//! Metadata is extracted directly from file contents (head + tail) rather than
-//! relying on `sessions-index.json` which is often stale.
+//! All metadata is extracted via a single full-file pass per session.
 
 use crate::message_classification::{counts_as_turn, is_first_prompt_candidate};
 use crate::session::{Session, SessionSource};
@@ -225,9 +224,11 @@ fn extract_session_metadata(
         first_message: scan.first_prompt,
         summary: scan.summary,
         name: scan.custom_title,
+        tag: scan.tag,
         turn_count: scan.turn_count,
         source,
         forked_from: scan.forked_from,
+        search_text_lower: scan.search_text_lower,
     })
 }
 
@@ -241,6 +242,7 @@ struct SessionScan {
     search_text_lower: String,
     summary: Option<String>,
     custom_title: Option<String>,
+    tag: Option<String>,
     /// Session should be excluded from the picker (sidechain or swarm-teammate).
     skip: bool,
 }
@@ -286,6 +288,15 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
                 if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
                     scan.custom_title = Some(t.to_string());
                 }
+                continue;
+            }
+            Some("tag") => {
+                // Empty tag = explicit removal (/tag followed by same name clears it)
+                scan.tag = entry
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
                 continue;
             }
             _ => {}
@@ -340,11 +351,6 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
 
     scan.search_text_lower = search_chunks.join("\n").to_lowercase();
     scan
-}
-
-/// Build lowercase searchable transcript text for user/assistant messages.
-pub fn session_search_text_lower(filepath: &Path) -> String {
-    scan_session_file(filepath).search_text_lower
 }
 
 /// Extract first text from message content (string or array of content blocks).
@@ -951,7 +957,7 @@ mod tests {
             ("/help", MessageKind::SlashCommand),
             (
                 "<command-message>init</command-message>",
-                MessageKind::CommandTag,
+                MessageKind::SystemTag,
             ),
             ("[local command output]", MessageKind::BracketedOutput),
             ("", MessageKind::Empty),
@@ -1170,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn session_search_text_lower_includes_user_and_assistant_text() {
+    fn scan_search_text_includes_user_and_assistant_text() {
         let temp_dir = std::env::temp_dir().join(format!(
             "cc-session-test-search-text-{}",
             std::process::id()
@@ -1186,9 +1192,50 @@ mod tests {
         )
         .unwrap();
 
-        let text = session_search_text_lower(&session_path);
+        let text = scan_session_file(&session_path).search_text_lower;
         assert!(text.contains("api status"));
         assert!(text.contains("service healthy"));
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_tag_empty_string_clears_previous() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-tag-clear-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"tag","tag":"important","sessionId":"x"}
+{"type":"user","message":{"role":"user","content":"work"},"cwd":"/tmp"}
+{"type":"tag","tag":"","sessionId":"x"}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.tag, None);
+
+        fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn scan_tag_takes_last_non_empty() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("cc-session-test-tag-last-{}", std::process::id()));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let session_path = temp_dir.join("test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"tag","tag":"old","sessionId":"x"}
+{"type":"tag","tag":"new","sessionId":"x"}"#,
+        )
+        .unwrap();
+
+        let scan = scan_session_file(&session_path);
+        assert_eq!(scan.tag, Some("new".to_string()));
 
         fs::remove_dir_all(&temp_dir).unwrap();
     }
