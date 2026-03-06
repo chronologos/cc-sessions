@@ -337,15 +337,15 @@ fn format_session_desc(session: &Session, max_chars: usize) -> String {
             return label.chars().take(max_chars).collect();
         }
         // Append summary if there's room for " - " + at least 10 chars
-        if let Some(summary) = &session.summary {
-            if max_chars > label_len + 13 {
-                let remaining = max_chars - label_len - 3;
-                return format!(
-                    "{} - {}",
-                    label,
-                    summary.chars().take(remaining).collect::<String>()
-                );
-            }
+        if let Some(summary) = &session.summary
+            && max_chars > label_len + 13
+        {
+            let remaining = max_chars - label_len - 3;
+            return format!(
+                "{} - {}",
+                label,
+                summary.chars().take(remaining).collect::<String>()
+            );
         }
         return label;
     }
@@ -463,18 +463,18 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
 
         match entry_type {
             Some("user") => {
-                if let Some(text) = extract_message_text(&entry) {
-                    if !is_system_content(&text) {
-                        let first_line = text.lines().next().unwrap_or(&text);
-                        let truncated = truncate_str(first_line, 120);
-                        output.push_str(&format!(
-                            "{}U: {}{}\n",
-                            colors::CYAN,
-                            truncated,
-                            colors::RESET
-                        ));
-                        line_count += 1;
-                    }
+                if let Some(text) = extract_message_text(&entry)
+                    && !is_system_content(&text)
+                {
+                    let first_line = text.lines().next().unwrap_or(&text);
+                    let truncated = truncate_str(first_line, 120);
+                    output.push_str(&format!(
+                        "{}U: {}{}\n",
+                        colors::CYAN,
+                        truncated,
+                        colors::RESET
+                    ));
+                    line_count += 1;
                 }
             }
             Some("assistant") => {
@@ -1095,11 +1095,10 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         // Enter: select session
         let selected_id = out.selected_items.first().map(|m| m.output().to_string());
         if let StateEffect::Select { session_id } = state.apply(StateAction::Enter { selected_id })
+            && let Some(session) = session_by_id.get(session_id.as_str())
         {
-            if let Some(session) = session_by_id.get(session_id.as_str()) {
-                resume_session(session, &session.filepath, fork)?;
-                return Ok(());
-            }
+            resume_session(session, &session.filepath, fork)?;
+            return Ok(());
         }
     }
 }

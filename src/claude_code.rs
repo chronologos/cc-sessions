@@ -302,20 +302,19 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             _ => {}
         }
 
-        if scan.project_path.is_empty() {
-            if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
-                scan.project_path = cwd.to_string();
-            }
+        if scan.project_path.is_empty()
+            && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
+        {
+            scan.project_path = cwd.to_string();
         }
 
-        if scan.forked_from.is_none() {
-            if let Some(parent_id) = entry
+        if scan.forked_from.is_none()
+            && let Some(parent_id) = entry
                 .get("forkedFrom")
                 .and_then(|f| f.get("sessionId"))
                 .and_then(|v| v.as_str())
-            {
-                scan.forked_from = Some(parent_id.to_string());
-            }
+        {
+            scan.forked_from = Some(parent_id.to_string());
         }
 
         // isMeta/isCompactSummary mark synthetic user messages (attachment
@@ -327,25 +326,23 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             continue;
         }
 
-        if entry_type == Some("user") {
-            if let Some(content) = entry.get("message").and_then(|m| m.get("content")) {
-                if let Some(text) = extract_text_content(content) {
-                    if scan.first_prompt.is_none() && is_first_prompt_candidate(&text) {
-                        scan.first_prompt = Some(crate::normalize_summary(&text, 50));
-                    }
-                    if counts_as_turn(&text) {
-                        scan.turn_count += 1;
-                    }
-                }
+        if entry_type == Some("user")
+            && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
+            && let Some(text) = extract_text_content(content)
+        {
+            if scan.first_prompt.is_none() && is_first_prompt_candidate(&text) {
+                scan.first_prompt = Some(crate::normalize_summary(&text, 50));
+            }
+            if counts_as_turn(&text) {
+                scan.turn_count += 1;
             }
         }
 
-        if matches!(entry_type, Some("user") | Some("assistant")) {
-            if let Some(text) = extract_message_text_for_search(&entry) {
-                if !text.is_empty() {
-                    search_chunks.push(text);
-                }
-            }
+        if matches!(entry_type, Some("user") | Some("assistant"))
+            && let Some(text) = extract_message_text_for_search(&entry)
+            && !text.is_empty()
+        {
+            search_chunks.push(text);
         }
     }
 
@@ -410,7 +407,7 @@ fn extract_message_text_for_search(entry: &serde_json::Value) -> Option<String> 
 
 /// Extract project name from path or directory name fallback
 ///
-/// Claude Code uses directory names like `-Users-iantay-Documents-repos-foo`
+/// Claude Code uses directory names like `-Users-alice-Documents-repos-foo`
 fn extract_project_name(project_path: &str, fallback_dir: &str) -> String {
     // Prefer cwd-based project name
     if !project_path.is_empty() {
@@ -422,7 +419,7 @@ fn extract_project_name(project_path: &str, fallback_dir: &str) -> String {
             .to_string();
     }
 
-    // Parse directory name: "-Users-iantay-Documents-repos-foo" -> "foo"
+    // Parse directory name: "-Users-alice-Documents-repos-foo" -> "foo"
     // Strip "-Users-<username>-" prefix dynamically
     let stripped = fallback_dir
         .strip_prefix("-Users-")
@@ -538,11 +535,11 @@ mod tests {
     #[test]
     fn extract_project_name_from_dir_fallback() {
         assert_eq!(
-            extract_project_name("", "-Users-iantay-Documents-repos-cc-session"),
+            extract_project_name("", "-Users-alice-Documents-repos-cc-session"),
             "cc-session"
         );
         assert_eq!(
-            extract_project_name("", "-Users-iantay-third-party-repos-foo"),
+            extract_project_name("", "-Users-alice-third-party-repos-foo"),
             "foo"
         );
         assert_eq!(
