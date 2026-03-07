@@ -188,6 +188,8 @@ pub fn sync_remote(
             "ssh",
             "--exclude",
             "*.lock", // Don't sync lock files
+            "--exclude",
+            LAST_SYNC_FILE, // Protect local staleness marker from --delete
             &source,
             &dest,
         ])

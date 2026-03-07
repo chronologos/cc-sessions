@@ -16,8 +16,16 @@ const SYSTEM_TAG_PREFIXES: &[&str] = &[
     "<ultraplan-mode>",
 ];
 
-fn starts_with_system_tag(text: &str) -> bool {
+pub fn starts_with_system_tag(text: &str) -> bool {
     SYSTEM_TAG_PREFIXES.iter().any(|p| text.starts_with(p))
+}
+
+/// Whether a user-message text payload should be hidden in transcript previews.
+///
+/// Narrower than `classify_user_text_for_metrics` — only hides content that is
+/// definitively system-generated, never content a user might plausibly type.
+pub fn is_system_content_for_preview(text: &str) -> bool {
+    starts_with_system_tag(text) || text.starts_with("[Request") || text.starts_with('/')
 }
 
 /// Classification for user-message text when computing session metrics.
@@ -114,5 +122,23 @@ mod tests {
         assert!(!is_first_prompt_candidate("<tick>"));
         assert!(!is_first_prompt_candidate("[Request interrupted by user]"));
         assert!(is_first_prompt_candidate("[not a request interrupt]"));
+    }
+
+    #[test]
+    fn is_system_content_for_preview_narrow_filter() {
+        // System-generated content: hide
+        assert!(is_system_content_for_preview(
+            "<command-message>init</command-message>"
+        ));
+        assert!(is_system_content_for_preview("<tick>"));
+        assert!(is_system_content_for_preview(
+            "[Request interrupted by user]"
+        ));
+        assert!(is_system_content_for_preview("/help"));
+
+        // Plausible user input: show
+        assert!(!is_system_content_for_preview("<Button> is broken"));
+        assert!(!is_system_content_for_preview("<div class='x'>"));
+        assert!(!is_system_content_for_preview("[not a request interrupt]"));
     }
 }

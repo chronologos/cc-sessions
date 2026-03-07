@@ -18,7 +18,9 @@
 //! Sessions are discovered by scanning for `.jsonl` files with valid UUID filenames.
 //! All metadata is extracted via a single full-file pass per session.
 
-use crate::message_classification::{counts_as_turn, is_first_prompt_candidate};
+use crate::message_classification::{
+    counts_as_turn, is_first_prompt_candidate, is_system_content_for_preview,
+};
 use crate::session::{Session, SessionSource};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -199,7 +201,12 @@ fn extract_session_metadata(
 
     let metadata = fs::metadata(filepath).ok()?;
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let created = metadata.created().unwrap_or(modified);
+    // Birthtime is meaningless for rsynced cache copies (it's when the local
+    // file was written, not when the remote session began). Fall back to mtime.
+    let created = match &source {
+        SessionSource::Local => metadata.created().unwrap_or(modified),
+        SessionSource::Remote { .. } => modified,
+    };
 
     let scan = scan_session_file(filepath);
 
@@ -291,12 +298,15 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
                 continue;
             }
             Some("tag") => {
-                // Empty tag = explicit removal (/tag followed by same name clears it)
-                scan.tag = entry
-                    .get("tag")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
+                // Empty string = explicit removal. Missing field = malformed,
+                // preserve existing (matches summary/custom-title semantics).
+                if let Some(t) = entry.get("tag").and_then(|v| v.as_str()) {
+                    scan.tag = if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    };
+                }
                 continue;
             }
             _ => {}
@@ -342,6 +352,11 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             && let Some(text) = extract_message_text_for_search(&entry)
             && !text.is_empty()
         {
+            // Keep search index aligned with preview: skip system-tag user
+            // payloads so Ctrl+S matches only what the preview will show.
+            if entry_type == Some("user") && is_system_content_for_preview(&text) {
+                continue;
+            }
             search_chunks.push(text);
         }
     }
@@ -412,6 +427,7 @@ fn extract_project_name(project_path: &str, fallback_dir: &str) -> String {
     // Prefer cwd-based project name
     if !project_path.is_empty() {
         return project_path
+            .trim_end_matches('/')
             .rsplit('/')
             .next()
             .filter(|s| !s.is_empty())
@@ -529,6 +545,18 @@ mod tests {
         assert_eq!(
             extract_project_name("/home/user/code/bike-power", "ignored"),
             "bike-power"
+        );
+    }
+
+    #[test]
+    fn extract_project_name_handles_trailing_slash() {
+        assert_eq!(
+            extract_project_name("/Users/foo/my-project/", "ignored"),
+            "my-project"
+        );
+        assert_eq!(
+            extract_project_name("/Users/foo/my-project///", "ignored"),
+            "my-project"
         );
     }
 
@@ -962,6 +990,28 @@ mod tests {
 {"type":"tag","tag":"","sessionId":"x"}"#,
         );
         assert_eq!(scan_session_file(&path).tag, None);
+    }
+
+    #[test]
+    fn scan_tag_missing_field_preserves_previous() {
+        let (_tmp, path) = scan_fixture(
+            r#"{"type":"tag","tag":"important","sessionId":"x"}
+{"type":"tag","sessionId":"x"}"#,
+        );
+        assert_eq!(scan_session_file(&path).tag, Some("important".to_string()));
+    }
+
+    #[test]
+    fn scan_search_text_excludes_system_tag_user_content() {
+        let (_tmp, path) = scan_fixture(
+            r#"{"type":"user","message":{"role":"user","content":"<command-message>deploy</command-message>"},"cwd":"/tmp"}
+{"type":"user","message":{"role":"user","content":"real question about API"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+        );
+        let text = scan_session_file(&path).search_text_lower;
+        assert!(!text.contains("deploy"));
+        assert!(text.contains("api"));
+        assert!(text.contains("answer"));
     }
 
     #[test]

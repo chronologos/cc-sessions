@@ -90,6 +90,9 @@ impl InteractiveState {
                 selected_id,
                 has_children,
             } => {
+                if self.search_results.is_some() {
+                    return Effect::Continue;
+                }
                 let Some(selected_id) = selected_id else {
                     return Effect::Continue;
                 };
@@ -105,6 +108,9 @@ impl InteractiveState {
                 Effect::Continue
             }
             Action::Left => {
+                if self.search_results.is_some() {
+                    return Effect::Continue;
+                }
                 self.focus_stack.pop();
                 Effect::Continue
             }
@@ -182,5 +188,35 @@ mod tests {
         );
         assert!(state.search_pattern().is_none());
         assert!(state.search_results().is_none());
+    }
+
+    #[test]
+    fn arrows_disabled_during_search() {
+        let mut state = InteractiveState::default();
+        state.push_focus_for_test("root");
+
+        let mut matched = HashSet::new();
+        matched.insert("x".to_string());
+        state.apply(Action::ApplySearchResults {
+            pattern: "q".to_string(),
+            matched_ids: matched,
+        });
+
+        // Right should not push focus while search is active
+        state.apply(Action::Right {
+            selected_id: Some("child".to_string()),
+            has_children: true,
+        });
+        assert_eq!(state.focus().map(String::as_str), Some("root"));
+
+        // Left should not pop focus while search is active
+        state.apply(Action::Left);
+        assert_eq!(state.focus().map(String::as_str), Some("root"));
+
+        // Esc clears search → arrows work again
+        state.apply(Action::Esc);
+        assert!(state.search_results().is_none());
+        state.apply(Action::Left);
+        assert!(state.focus().is_none());
     }
 }

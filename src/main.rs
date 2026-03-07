@@ -503,7 +503,7 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
 
 /// Check if content is system/XML content that should be skipped in previews
 fn is_system_content(text: &str) -> bool {
-    text.starts_with('[') || text.starts_with('<') || text.starts_with('/')
+    message_classification::is_system_content_for_preview(text)
 }
 
 /// A message from the transcript
