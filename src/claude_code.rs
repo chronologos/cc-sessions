@@ -356,7 +356,7 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             && let Some(first) = iter_text_blocks(content).next()
         {
             if scan.first_prompt.is_none() && is_first_prompt_candidate(first) {
-                scan.first_prompt = Some(crate::normalize_summary(first, 50));
+                scan.first_prompt = Some(crate::normalize_summary(first, 120));
             }
             if counts_as_turn(first) {
                 scan.turn_count += 1;

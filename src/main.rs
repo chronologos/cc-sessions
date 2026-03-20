@@ -433,17 +433,11 @@ fn extract_message_text(entry: &serde_json::Value) -> Option<&str> {
     claude_code::first_text_block(content)
 }
 
-/// Truncate string to max chars, adding ... if truncated
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", s.chars().take(max).collect::<String>())
-    }
-}
-
-/// Generate preview content as a string (for skim's preview pane)
+/// Generate preview content as a string (for skim's preview pane). Skim is
+/// configured with `:wrap`, so we emit untruncated lines and let the pane
+/// handle overflow — no arbitrary width caps.
 fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
+    use std::fmt::Write as _;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
@@ -473,39 +467,22 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
         };
         line.clear();
 
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
+        let (role_glyph, color) = match entry.get("type").and_then(|v| v.as_str()) {
+            Some("user") => ('U', colors::CYAN),
+            Some("assistant") => ('A', colors::YELLOW),
+            _ => continue,
+        };
 
-        match entry_type {
-            Some("user") => {
-                if let Some(text) = extract_message_text(&entry)
-                    && !is_system_content(text)
-                {
-                    let first_line = text.lines().next().unwrap_or(text);
-                    let truncated = truncate_str(first_line, 120);
-                    output.push_str(&format!(
-                        "{}U: {}{}\n",
-                        colors::CYAN,
-                        truncated,
-                        colors::RESET
-                    ));
-                    line_count += 1;
-                }
-            }
-            Some("assistant") => {
-                if let Some(text) = extract_message_text(&entry) {
-                    let first_line = text.lines().next().unwrap_or(text);
-                    let truncated = truncate_str(first_line, 80);
-                    output.push_str(&format!(
-                        "{}A: {}{}\n",
-                        colors::YELLOW,
-                        truncated,
-                        colors::RESET
-                    ));
-                    line_count += 1;
-                }
-            }
-            _ => {}
+        let Some(text) = extract_message_text(&entry) else {
+            continue;
+        };
+        if role_glyph == 'U' && is_system_content(text) {
+            continue;
         }
+
+        let first_line = text.lines().next().unwrap_or(text);
+        let _ = writeln!(output, "{color}{role_glyph}: {first_line}{}", colors::RESET);
+        line_count += 1;
     }
 
     if output.is_empty() {
@@ -929,8 +906,19 @@ fn build_subtree_header(
     format!("{}\n{}", status_line, legend)
 }
 
-/// Simple session row format (no tree glyphs)
-fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> String {
+/// Width (in columns) consumed by the fixed fields before SUMMARY:
+/// prefix (2) + CRE (4+1) + MOD (4+1) + MSG (3+1) + SOURCE (6+1) + PROJECT (12+1).
+const FIXED_COLS: usize = 36;
+
+/// Simple session row format (no tree glyphs). `desc_width` is the budget for
+/// the trailing summary column — caller computes it from the available pane
+/// width so we only truncate when we actually run out of space.
+fn format_session_row_simple(
+    prefix: &str,
+    session: &Session,
+    debug: bool,
+    desc_width: usize,
+) -> String {
     let created = format_time_relative(session.created);
     let modified = format_time_relative(session.modified);
     let source = session.source.display_name();
@@ -941,12 +929,19 @@ fn format_session_row_simple(prefix: &str, session: &Session, debug: bool) -> St
     };
     let msgs = format!("{:>3}", session.turn_count);
 
-    let desc = format_session_desc(session, 40);
+    let desc = format_session_desc(session, desc_width);
 
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
         prefix, id_prefix, created, modified, msgs, source, session.project, desc,
     )
+}
+
+/// Available width for the SUMMARY column given the list pane width.
+/// Floors at a small minimum so very narrow terminals still show something.
+fn desc_budget(pane_width: u16, debug: bool) -> usize {
+    let fixed = FIXED_COLS + if debug { 6 } else { 0 };
+    (pane_width as usize).saturating_sub(fixed).max(20)
 }
 
 /// Build column legend for interactive mode
@@ -1019,6 +1014,12 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
     let mut state = InteractiveState::default();
 
     loop {
+        // Re-query each loop so terminal resizes between skim invocations are
+        // picked up. Preview pane is configured as right:50%, so the list pane
+        // gets roughly the other half.
+        let (term_w, _) = crossterm::terminal::size().unwrap_or((160, 40));
+        let desc_width = desc_budget(term_w / 2, debug);
+
         let focus = state.focus().map(String::as_str);
         let visible_sessions = visible_sessions_for_view(
             sessions,
@@ -1069,7 +1070,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                 };
                 Arc::new(SessionItem {
                     filepath: session.filepath.clone(),
-                    display: format_session_row_simple(prefix, session, debug),
+                    display: format_session_row_simple(prefix, session, debug, desc_width),
                     session_id: session.id.clone(),
                     search_pattern: search_pattern.map(str::to_owned),
                 }) as Arc<dyn SkimItem>
@@ -1449,7 +1450,7 @@ mod tests {
     #[test]
     fn format_session_row_simple_basic() {
         let session = test_session("test-id");
-        let row = format_session_row_simple("  ", &session, false);
+        let row = format_session_row_simple("  ", &session, false, 40);
 
         // Should contain project name and source
         assert!(row.contains("test-proj"));
@@ -1463,7 +1464,7 @@ mod tests {
     #[test]
     fn format_session_row_simple_with_debug() {
         let session = test_session("abcdef-1234");
-        let row = format_session_row_simple("▶ ", &session, true);
+        let row = format_session_row_simple("▶ ", &session, true, 40);
 
         // Should contain first 5 chars of ID
         assert!(row.contains("abcde"));
@@ -1472,10 +1473,20 @@ mod tests {
     }
 
     #[test]
+    fn desc_budget_scales_with_pane_width() {
+        // 200-col pane → 200 − 36 fixed = 164
+        assert_eq!(desc_budget(200, false), 164);
+        // Debug adds 6 for the ID prefix
+        assert_eq!(desc_budget(200, true), 158);
+        // Narrow pane floors at 20
+        assert_eq!(desc_budget(40, false), 20);
+    }
+
+    #[test]
     fn format_session_row_simple_shows_turn_count() {
         let mut session = test_session("test");
         session.turn_count = 42;
-        let row = format_session_row_simple("  ", &session, false);
+        let row = format_session_row_simple("  ", &session, false, 40);
 
         // Turn count should be right-aligned in 3 chars
         assert!(row.contains(" 42 "));
