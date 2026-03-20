@@ -935,19 +935,6 @@ fn format_session_row_simple(
     let project = elide_middle(&session.project, 12);
 
     let desc = format_session_desc(session, desc_width);
-    // Named sessions (via /rename) get bold+yellow so they stand out in the
-    // picker. Requires .ansi(true) on the skim options.
-    let desc = if session.name.is_some() {
-        format!(
-            "{}{}{}{}",
-            colors::BOLD,
-            colors::YELLOW,
-            desc,
-            colors::RESET
-        )
-    } else {
-        desc
-    };
 
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
@@ -1077,7 +1064,6 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 
         let options = SkimOptionsBuilder::default()
             .height("100%")
-            .ansi(true)
             .preview("") // enables preview pane
             .preview_window("right:50%:wrap")
             .header(&header)
@@ -1108,6 +1094,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     filepath: session.filepath.clone(),
                     display: format_session_row_simple(prefix, session, debug, desc_width),
                     session_id: session.id.clone(),
+                    named: session.name.is_some(),
                     search_pattern: search_pattern.map(str::to_owned),
                 }) as Arc<dyn SkimItem>
             })
@@ -1191,12 +1178,24 @@ struct SessionItem {
     filepath: PathBuf,
     display: String,
     session_id: String,
+    named: bool,                    // Has a custom title — render bold+yellow
     search_pattern: Option<String>, // When set, preview shows matching lines
 }
 
 impl SkimItem for SessionItem {
     fn text(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.display)
+    }
+
+    fn display<'a>(&'a self, mut context: DisplayContext) -> ratatui::text::Line<'a> {
+        use ratatui::style::{Color, Modifier};
+        if self.named {
+            context.base_style = context
+                .base_style
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+        }
+        context.to_line(Cow::Borrowed(&self.display))
     }
 
     fn output(&self) -> Cow<'_, str> {

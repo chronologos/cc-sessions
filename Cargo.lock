@@ -245,6 +245,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "memchr",
+ "ratatui",
  "rayon",
  "serde",
  "serde_json",

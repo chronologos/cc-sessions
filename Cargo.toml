@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 memchr = "2"
 skim = { version = "3", default-features = false }
+ratatui = { version = "0.30", default-features = false }
 crossterm = "0.29"
 shellexpand = "3"
 
