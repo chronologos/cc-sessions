@@ -371,26 +371,31 @@ fn filter_forks_for_list(sessions: &[Session], include_forks: bool) -> Vec<&Sess
 
 /// Normalize text for display: collapse whitespace, strip markdown, truncate gracefully
 pub fn normalize_summary(text: &str, max_chars: usize) -> String {
-    // Collapse all whitespace (including newlines) to single spaces
-    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    // Strip common markdown prefixes
-    let stripped = normalized.trim_start_matches(['#', '*']).trim_start();
-
-    // Fast path for short strings
-    if stripped.chars().count() <= max_chars {
-        return stripped.to_string();
+    // Collapse whitespace and build directly into the output buffer — stop
+    // collecting once we're past max_chars (summary inputs can be very long).
+    let mut normalized = String::with_capacity(max_chars.min(text.len()) + 4);
+    let mut words = text.split_whitespace();
+    if let Some(first) = words.next() {
+        normalized.push_str(first);
+        for w in words {
+            normalized.push(' ');
+            normalized.push_str(w);
+            if normalized.len() > max_chars * 4 {
+                break;
+            }
+        }
     }
 
-    // Truncate at char boundary, break at word if possible
-    let truncated: String = stripped.chars().take(max_chars).collect();
+    let stripped = normalized.trim_start_matches(['#', '*']).trim_start();
 
-    // Try to break at last word boundary (if past halfway point)
+    if stripped.chars().count() <= max_chars {
+        return stripped.to_owned();
+    }
+
+    let truncated: String = stripped.chars().take(max_chars).collect();
     let break_point = truncated
-        .rmatch_indices(' ')
-        .next()
-        .filter(|(i, _)| *i > max_chars / 2)
-        .map(|(i, _)| i)
+        .rfind(' ')
+        .filter(|&i| i > max_chars / 2)
         .unwrap_or(truncated.len());
 
     format!("{}...", &truncated[..break_point])
@@ -422,10 +427,10 @@ fn print_session_preview(filepath: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Extract text content from a message entry
-fn extract_message_text(entry: &serde_json::Value) -> Option<String> {
+/// Extract first text block from a message entry, borrowing from the JSON value
+fn extract_message_text(entry: &serde_json::Value) -> Option<&str> {
     let content = entry.get("message")?.get("content")?;
-    claude_code::extract_text_content(content)
+    claude_code::first_text_block(content)
 }
 
 /// Truncate string to max chars, adding ... if truncated
@@ -443,30 +448,39 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
     use std::io::{BufRead, BufReader};
 
     let file = File::open(filepath).context("Could not open session file")?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut output = String::new();
+    let mut line = String::new();
     let mut line_count = 0;
     const MAX_LINES: usize = 100;
 
-    for line in reader.lines().map_while(Result::ok) {
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
         if line_count >= MAX_LINES {
             break;
+        }
+        if !claude_code::line_mentions_content_type(line.as_bytes()) {
+            line.clear();
+            continue;
         }
 
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                line.clear();
+                continue;
+            }
         };
+        line.clear();
 
         let entry_type = entry.get("type").and_then(|v| v.as_str());
 
         match entry_type {
             Some("user") => {
                 if let Some(text) = extract_message_text(&entry)
-                    && !is_system_content(&text)
+                    && !is_system_content(text)
                 {
-                    let first_line = text.lines().next().unwrap_or(&text);
+                    let first_line = text.lines().next().unwrap_or(text);
                     let truncated = truncate_str(first_line, 120);
                     output.push_str(&format!(
                         "{}U: {}{}\n",
@@ -479,7 +493,7 @@ fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
             }
             Some("assistant") => {
                 if let Some(text) = extract_message_text(&entry) {
-                    let first_line = text.lines().next().unwrap_or(&text);
+                    let first_line = text.lines().next().unwrap_or(text);
                     let truncated = truncate_str(first_line, 80);
                     output.push_str(&format!(
                         "{}A: {}{}\n",
@@ -518,31 +532,39 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
     use std::io::{BufRead, BufReader};
 
     let file = File::open(filepath).context("Could not open session file")?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
-    // Collect all messages first
+    // Collect all messages first (filter out progress/attachment lines before
+    // the JSON parse — large sessions are dominated by those).
     let mut messages: Vec<Message> = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
+    let mut line = String::new();
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+        if !claude_code::line_mentions_content_type(line.as_bytes()) {
+            line.clear();
+            continue;
+        }
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                line.clear();
+                continue;
+            }
         };
+        line.clear();
 
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-        let role = match entry_type {
+        let role = match entry.get("type").and_then(|v| v.as_str()) {
             Some("user") => "user",
             Some("assistant") => "assistant",
             _ => continue,
         };
 
         if let Some(text) = extract_message_text(&entry) {
-            // Skip system prompts and XML content for user messages
-            if role == "user" && is_system_content(&text) {
+            if role == "user" && is_system_content(text) {
                 continue;
             }
             messages.push(Message {
-                role: role.to_string(),
-                text,
+                role: role.to_owned(),
+                text: text.to_owned(),
             });
         }
     }
@@ -698,45 +720,58 @@ fn format_matching_message(msg: &Message, pattern: &str) -> String {
 }
 
 /// Highlight matching text with bold/inverse (Unicode-safe)
-///
-/// Uses character-based matching to handle cases where lowercasing
-/// changes byte length (e.g., ß → ss, İ → i̇).
 fn highlight_match(text: &str, pattern: &str) -> String {
     if pattern.is_empty() {
-        return text.to_string();
+        return text.to_owned();
     }
 
+    // Fast path: ASCII-only text and pattern. Lowercasing preserves byte
+    // positions, so we lower once and match_indices gives us offsets directly.
+    // This is O(n) vs. the generic path's per-position re-lowering.
+    if text.is_ascii() && pattern.is_ascii() {
+        let text_lower = text.to_ascii_lowercase();
+        let pattern_lower = pattern.to_ascii_lowercase();
+        let mut result = String::with_capacity(text.len() + 16);
+        let mut last = 0;
+        for (i, _) in text_lower.match_indices(&pattern_lower) {
+            result.push_str(&text[last..i]);
+            result.push_str(colors::BOLD_INVERSE);
+            result.push_str(&text[i..i + pattern.len()]);
+            result.push_str(colors::RESET);
+            last = i + pattern.len();
+        }
+        result.push_str(&text[last..]);
+        return result;
+    }
+
+    // Generic path: handles case-fold expansion (ß → ss, İ → i̇). Walk the
+    // original by char, lower only the pattern-sized window at each position.
     let pattern_lower = pattern.to_lowercase();
     let pattern_char_count = pattern.chars().count();
-    let mut result = String::new();
+    let mut result = String::with_capacity(text.len() + 16);
     let mut last_end = 0;
+
+    let indices: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+
     let mut i = 0;
-
-    while i < text.len() {
-        let remaining = &text[i..];
-        let remaining_lower = remaining.to_lowercase();
-
-        if remaining_lower.starts_with(&pattern_lower) {
-            // Found match - count characters to get correct byte length in original
-            let match_byte_len = remaining
-                .char_indices()
-                .nth(pattern_char_count)
-                .map(|(idx, _)| idx)
-                .unwrap_or(remaining.len());
-
-            result.push_str(&text[last_end..i]);
+    while i + pattern_char_count < indices.len() {
+        let start = indices[i];
+        let end = indices[i + pattern_char_count];
+        if text[start..end].to_lowercase() == pattern_lower {
+            result.push_str(&text[last_end..start]);
             result.push_str(colors::BOLD_INVERSE);
-            result.push_str(&text[i..i + match_byte_len]);
+            result.push_str(&text[start..end]);
             result.push_str(colors::RESET);
-
-            last_end = i + match_byte_len;
-            i = last_end;
+            last_end = end;
+            i += pattern_char_count;
         } else {
-            // Advance to next character boundary
-            i += remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            i += 1;
         }
     }
-
     result.push_str(&text[last_end..]);
     result
 }
@@ -832,22 +867,16 @@ fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> 
 // =============================================================================
 
 /// Build a map of parent session ID → child sessions (forks)
-fn build_fork_tree<'a>(
-    sessions: &[&'a Session],
-) -> std::collections::HashMap<String, Vec<&'a Session>> {
+fn build_fork_tree(sessions: &[Session]) -> std::collections::HashMap<&str, Vec<&Session>> {
     use std::collections::HashMap;
-    let mut children_map: HashMap<String, Vec<&Session>> = HashMap::new();
+    let mut children_map: HashMap<&str, Vec<&Session>> = HashMap::new();
 
     for session in sessions {
-        if let Some(ref parent_id) = session.forked_from {
-            children_map
-                .entry(parent_id.clone())
-                .or_default()
-                .push(session);
+        if let Some(parent_id) = session.forked_from.as_deref() {
+            children_map.entry(parent_id).or_default().push(session);
         }
     }
 
-    // Sort children by modified time (most recent first)
     for children in children_map.values_mut() {
         children.sort_by(|a, b| b.modified.cmp(&a.modified));
     }
@@ -857,16 +886,16 @@ fn build_fork_tree<'a>(
 
 /// Build header showing current navigation state
 fn build_subtree_header(
-    search_pattern: &Option<String>,
+    search_pattern: Option<&str>,
     search_count: Option<usize>,
     fork: bool,
-    focus: Option<&String>,
+    focus: Option<&str>,
     session_by_id: &std::collections::HashMap<&str, &Session>,
     debug: bool,
 ) -> String {
     // When searching, show esc to clear; otherwise show navigation hints
     let (nav_hint, focus_info) = if search_pattern.is_some() {
-        ("esc to clear".to_string(), String::new())
+        ("esc to clear", String::new())
     } else {
         let hint = if focus.is_some() {
             "← back"
@@ -874,13 +903,10 @@ fn build_subtree_header(
             "→ into forks"
         };
         let info = focus
-            .and_then(|id| session_by_id.get(id.as_str()))
-            .map(|s| {
-                let desc = format_session_desc(s, 30);
-                format!(" [{}]", desc)
-            })
+            .and_then(|id| session_by_id.get(id))
+            .map(|s| format!(" [{}]", format_session_desc(s, 30)))
             .unwrap_or_default();
-        (hint.to_string(), info)
+        (hint, info)
     };
 
     let status_line = match (search_pattern, search_count, fork) {
@@ -934,12 +960,11 @@ fn build_column_legend(debug: bool) -> String {
 fn visible_sessions_for_view<'a>(
     sessions: &'a [Session],
     session_by_id: &std::collections::HashMap<&str, &'a Session>,
-    children_map: &std::collections::HashMap<String, Vec<&'a Session>>,
+    children_map: &std::collections::HashMap<&str, Vec<&'a Session>>,
     search_results: Option<&std::collections::HashSet<String>>,
-    focus: Option<&String>,
+    focus: Option<&str>,
 ) -> Vec<&'a Session> {
     if let Some(matched_ids) = search_results {
-        // Search mode: show only sessions that matched the search
         return sessions
             .iter()
             .filter(|s| matched_ids.contains(&s.id))
@@ -947,9 +972,8 @@ fn visible_sessions_for_view<'a>(
     }
 
     if let Some(focus_id) = focus {
-        // Subtree mode: show focused session + direct children only
         let mut result = Vec::new();
-        if let Some(session) = session_by_id.get(focus_id.as_str()) {
+        if let Some(session) = session_by_id.get(focus_id) {
             result.push(*session);
             if let Some(children) = children_map.get(focus_id) {
                 result.extend(children.iter().copied());
@@ -963,8 +987,8 @@ fn visible_sessions_for_view<'a>(
         .iter()
         .filter(|s| {
             s.forked_from
-                .as_ref()
-                .map(|p| !session_by_id.contains_key(p.as_str()))
+                .as_deref()
+                .map(|p| !session_by_id.contains_key(p))
                 .unwrap_or(true)
         })
         .collect()
@@ -976,12 +1000,12 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 
     let session_by_id: HashMap<&str, &Session> =
         sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-    let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
+    let children_map = build_fork_tree(sessions);
 
     let mut state = InteractiveState::default();
 
     loop {
-        let focus = state.focus();
+        let focus = state.focus().map(String::as_str);
         let visible_sessions = visible_sessions_for_view(
             sessions,
             &session_by_id,
@@ -991,9 +1015,9 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         );
 
         let search_count = state.search_results().map(|r| r.len());
-        let search_pattern = state.search_pattern().cloned();
+        let search_pattern = state.search_pattern().map(String::as_str);
         let header = build_subtree_header(
-            &search_pattern,
+            search_pattern,
             search_count,
             fork,
             focus,
@@ -1022,10 +1046,9 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         let items: Vec<Arc<dyn SkimItem>> = visible_sessions
             .iter()
             .map(|session| {
-                let is_focus = focus.map(|f| f == &session.id).unwrap_or(false);
-                let prefix = if is_focus {
+                let prefix = if focus == Some(session.id.as_str()) {
                     "▷ "
-                } else if children_map.contains_key(&session.id) {
+                } else if children_map.contains_key(session.id.as_str()) {
                     "▶ "
                 } else {
                     "  "
@@ -1034,7 +1057,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
                     filepath: session.filepath.clone(),
                     display: format_session_row_simple(prefix, session, debug),
                     session_id: session.id.clone(),
-                    search_pattern: search_pattern.clone(),
+                    search_pattern: search_pattern.map(str::to_owned),
                 }) as Arc<dyn SkimItem>
             })
             .collect();
@@ -1060,7 +1083,9 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             let StateEffect::RunSearch { pattern } = effect else {
                 continue;
             };
-            let pattern_lower = pattern.to_lowercase();
+            // Index is built with make_ascii_lowercase(); fold the query the
+            // same way so non-ASCII letters compare identically on both sides.
+            let pattern_lower = pattern.to_ascii_lowercase();
             let matched_ids: std::collections::HashSet<String> = sessions
                 .iter()
                 .filter(|s| s.search_text_lower.contains(&pattern_lower))
@@ -1076,7 +1101,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         if key.0 == KeyCode::Right {
             let selected_id = out.selected_items.first().map(|m| m.output().to_string());
             let has_children = selected_id
-                .as_ref()
+                .as_deref()
                 .map(|id| children_map.contains_key(id))
                 .unwrap_or(false);
             let _ = state.apply(StateAction::Right {
@@ -1308,7 +1333,7 @@ mod tests {
         let mut child2 = test_session("child2");
         child2.forked_from = Some("root".to_string());
 
-        let sessions: Vec<&Session> = vec![&root, &child1, &child2];
+        let sessions = vec![root, child1, child2];
         let children_map = build_fork_tree(&sessions);
 
         assert!(children_map.contains_key("root"));
@@ -1326,7 +1351,7 @@ mod tests {
         let mut grandchild = test_session("grandchild");
         grandchild.forked_from = Some("child".to_string());
 
-        let sessions: Vec<&Session> = vec![&root, &child, &grandchild];
+        let sessions = vec![root, child, grandchild];
         let children_map = build_fork_tree(&sessions);
 
         assert_eq!(children_map.get("root").unwrap().len(), 1);
@@ -1358,7 +1383,7 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
-        let header = build_subtree_header(&None, None, false, None, &session_by_id, false);
+        let header = build_subtree_header(None, None, false, None, &session_by_id, false);
         assert!(header.contains("Select session"));
         assert!(header.contains("→ into forks"));
         assert!(header.contains("CRE")); // Legend line
@@ -1369,7 +1394,7 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
-        let header = build_subtree_header(&None, None, true, None, &session_by_id, false);
+        let header = build_subtree_header(None, None, true, None, &session_by_id, false);
         assert!(header.contains("FORK mode"));
     }
 
@@ -1378,15 +1403,7 @@ mod tests {
         use std::collections::HashMap;
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
-        // Search with match count
-        let header = build_subtree_header(
-            &Some("api".to_string()),
-            Some(5),
-            false,
-            None,
-            &session_by_id,
-            false,
-        );
+        let header = build_subtree_header(Some("api"), Some(5), false, None, &session_by_id, false);
         assert!(header.contains("search: \"api\""));
         assert!(header.contains("(5 matches)"));
         assert!(header.contains("esc to clear"));
@@ -1399,8 +1416,8 @@ mod tests {
         let mut session_by_id: HashMap<&str, &Session> = HashMap::new();
         session_by_id.insert("focused", &session);
 
-        let focus = "focused".to_string();
-        let header = build_subtree_header(&None, None, false, Some(&focus), &session_by_id, false);
+        let header =
+            build_subtree_header(None, None, false, Some("focused"), &session_by_id, false);
         assert!(header.contains("← back"));
         assert!(!header.contains("→ into forks"));
     }
@@ -1534,17 +1551,11 @@ mod tests {
         let sessions = vec![root, child, sibling];
         let session_by_id: HashMap<&str, &Session> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
-        let children_map = build_fork_tree(&sessions.iter().collect::<Vec<_>>());
+        let children_map = build_fork_tree(&sessions);
 
         // Focused subtree should show root + child
-        let focus = Some("root".to_string());
-        let visible = visible_sessions_for_view(
-            &sessions,
-            &session_by_id,
-            &children_map,
-            None,
-            focus.as_ref(),
-        );
+        let visible =
+            visible_sessions_for_view(&sessions, &session_by_id, &children_map, None, Some("root"));
         let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["root", "child"]);
 
@@ -1556,19 +1567,14 @@ mod tests {
             &session_by_id,
             &children_map,
             Some(&matched),
-            focus.as_ref(),
+            Some("root"),
         );
         let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["sibling"]);
 
         // Clearing search restores subtree view
-        let visible = visible_sessions_for_view(
-            &sessions,
-            &session_by_id,
-            &children_map,
-            None,
-            focus.as_ref(),
-        );
+        let visible =
+            visible_sessions_for_view(&sessions, &session_by_id, &children_map, None, Some("root"));
         let ids: Vec<&str> = visible.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["root", "child"]);
     }

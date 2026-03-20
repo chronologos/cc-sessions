@@ -286,17 +286,26 @@ fn update_last_sync(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Sync remotes, optionally checking staleness first.
+/// Sync remotes, optionally checking staleness first. Individual rsync
+/// invocations run concurrently — each blocks on a separate SSH connection,
+/// so wall-clock is max(rsync) not sum(rsync).
 fn sync_remotes(config: &Config, check_staleness: bool) -> Result<SyncSummary> {
+    use rayon::prelude::*;
+
+    let targets: Vec<(&String, &RemoteConfig)> = config
+        .remotes
+        .iter()
+        .filter(|(name, _)| !check_staleness || is_stale(name, &config.settings).unwrap_or(true))
+        .collect();
+
+    let outcomes: Vec<_> = targets
+        .into_par_iter()
+        .map(|(name, remote)| (name, sync_remote(name, remote, &config.settings)))
+        .collect();
+
     let mut summary = SyncSummary::default();
-
-    for (name, remote) in &config.remotes {
-        // Skip non-stale remotes if checking staleness
-        if check_staleness && !is_stale(name, &config.settings)? {
-            continue;
-        }
-
-        match sync_remote(name, remote, &config.settings) {
+    for (name, outcome) in outcomes {
+        match outcome {
             Ok(result) => summary.successes.push(result),
             Err(e) => {
                 let reason = e.to_string();

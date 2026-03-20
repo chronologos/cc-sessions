@@ -13,6 +13,7 @@ walkdir = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+memchr = "2"
 skim = { version = "3", default-features = false }
 crossterm = "0.29"
 shellexpand = "3"

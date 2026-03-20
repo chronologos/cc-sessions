@@ -100,7 +100,14 @@ This filters out:
 
 ### Metadata Extraction
 
-All fields come from a single full-file pass (one open, one `BufReader` scan):
+All fields come from a single full-file pass with a reused line buffer. The first
+`HEADER_SCAN_LINES` (16) lines are parsed fully to capture session-level metadata
+(cwd, forkedFrom, isSidechain, teamName — stamped on every entry, so reliably
+present early). After that, a SIMD-accelerated byte scan (`memchr::memmem`) skips
+lines that don't mention a content-bearing `"type":` (user/assistant/summary/
+custom-title/tag), avoiding JSON parsing for the ~99% of lines that are
+progress/attachment chatter in long-running sessions.
+
 
 | Field | Source | Selection |
 |-------|--------|-----------|
@@ -269,4 +276,5 @@ The MSG column shows actual user turns, filtering out system-generated content:
 | `skim` | Embedded fuzzy finder (replaces fzf) |
 | `rayon` | Parallel file processing |
 | `serde_json` | JSONL parsing |
+| `memchr` | SIMD substring search for the line prefilter |
 | `clap` | CLI argument parsing |

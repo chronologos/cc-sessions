@@ -23,10 +23,12 @@ use crate::message_classification::{
 };
 use crate::session::{Session, SessionSource};
 use anyhow::{Context, Result};
+use memchr::memmem;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
@@ -76,11 +78,13 @@ pub fn find_all_sessions_with_summary(
 
     let mut summary = DiscoverySummary::default();
 
-    // Load local sessions
+    // Load local sessions (unsorted — final sort happens once at the end)
     if should_include_source(remote_filter, "local") {
         let local_dir = get_claude_projects_dir()?;
         if local_dir.exists() {
-            summary.sessions.extend(find_sessions(&local_dir)?);
+            summary
+                .sessions
+                .extend(find_sessions_with_source(&local_dir, SessionSource::Local)?);
         }
     }
 
@@ -122,12 +126,12 @@ pub fn find_all_sessions_with_summary(
 // Session Loading
 // =============================================================================
 
-/// Find all sessions by scanning .jsonl files directly.
-///
-/// This replaces the previous two-phase approach (index + orphan) with a single
-/// unified scan. All metadata is extracted directly from file contents.
+/// Find all sessions by scanning .jsonl files directly (sorted newest-first).
+#[cfg(test)]
 pub fn find_sessions(projects_dir: &Path) -> Result<Vec<Session>> {
-    find_sessions_with_source(projects_dir, SessionSource::Local)
+    let mut sessions = find_sessions_with_source(projects_dir, SessionSource::Local)?;
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(sessions)
 }
 
 /// Find sessions with a specific source tag.
@@ -144,37 +148,34 @@ pub fn find_sessions_with_source(
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| is_valid_session_file(e.path()))
-        .map(|e| e.path().to_path_buf())
+        .map(|e| e.into_path())
         .collect();
 
-    // Process files in parallel, extracting metadata from each
-    let mut sessions: Vec<Session> = jsonl_files
-        .par_iter()
-        .filter_map(|filepath| {
-            let parent_dir = filepath
-                .parent()?
-                .file_name()?
-                .to_string_lossy()
-                .to_string();
-            extract_session_metadata(filepath, &parent_dir, source.clone())
-        })
+    // File sizes are wildly skewed (sessions range from a few KB to hundreds of
+    // MB). Force per-item task granularity so rayon can steal individual files;
+    // the default recursive-split chunking bundles multiple large files into one
+    // unstealable range and stalls other workers.
+    let sessions: Vec<Session> = jsonl_files
+        .into_par_iter()
+        .with_max_len(1)
+        .filter_map(|filepath| extract_session_metadata(filepath, &source))
         .collect();
 
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     Ok(sessions)
 }
 
 /// Check if a string is a valid UUID (8-4-4-4-12 format with hex chars)
 fn is_valid_session_uuid(s: &str) -> bool {
-    const SEGMENT_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
-
-    let parts: Vec<&str> = s.split('-').collect();
-    parts.len() == 5
-        && parts
-            .iter()
-            .zip(SEGMENT_LENGTHS)
-            .all(|(part, len)| part.len() == len)
-        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    const DASH_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+    let bytes = s.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            if DASH_POSITIONS.contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// Check if a path is a valid session file (UUID-named .jsonl).
@@ -192,23 +193,19 @@ fn is_valid_session_file(path: &Path) -> bool {
 }
 
 /// Extract all session metadata from a .jsonl file in a single pass.
-fn extract_session_metadata(
-    filepath: &Path,
-    parent_dir_name: &str,
-    source: SessionSource,
-) -> Option<Session> {
-    let id = filepath.file_stem()?.to_string_lossy().to_string();
+fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option<Session> {
+    let id = filepath.file_stem()?.to_string_lossy().into_owned();
 
-    let metadata = fs::metadata(filepath).ok()?;
+    let metadata = fs::metadata(&filepath).ok()?;
     let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
     // Birthtime is meaningless for rsynced cache copies (it's when the local
     // file was written, not when the remote session began). Fall back to mtime.
-    let created = match &source {
+    let created = match source {
         SessionSource::Local => metadata.created().unwrap_or(modified),
         SessionSource::Remote { .. } => modified,
     };
 
-    let scan = scan_session_file(filepath);
+    let scan = scan_session_file(&filepath);
 
     if scan.skip {
         return None;
@@ -219,13 +216,14 @@ fn extract_session_metadata(
         return None;
     }
 
-    let project = extract_project_name(&scan.project_path, parent_dir_name);
+    let parent_dir_name = filepath.parent()?.file_name()?.to_string_lossy();
+    let project = extract_project_name(&scan.project_path, &parent_dir_name);
 
     Some(Session {
         id,
         project,
         project_path: scan.project_path,
-        filepath: filepath.to_path_buf(),
+        filepath,
         created,
         modified,
         first_message: scan.first_prompt,
@@ -233,7 +231,7 @@ fn extract_session_metadata(
         name: scan.custom_title,
         tag: scan.tag,
         turn_count: scan.turn_count,
-        source,
+        source: source.clone(),
         forked_from: scan.forked_from,
         search_text_lower: scan.search_text_lower,
     })
@@ -254,19 +252,42 @@ struct SessionScan {
     skip: bool,
 }
 
+/// Number of lines to parse fully before the byte-level prefilter engages.
+/// Session-level metadata (cwd, forkedFrom, isSidechain, teamName) is stamped on
+/// every entry, so it is reliably present within the first handful of lines.
+const HEADER_SCAN_LINES: usize = 16;
+
 /// Scan a session file once to collect all metadata, turn count, and search text.
 ///
-/// Single file open, single pass. Summary and custom-title entries can appear
-/// anywhere (compaction, /rename mid-session); last well-formed occurrence wins.
+/// Single file open, single pass. After the first `HEADER_SCAN_LINES` lines,
+/// a cheap byte-level check skips lines that cannot contribute content (the
+/// bulk of large sessions is `progress` chatter we never read).
 fn scan_session_file(filepath: &Path) -> SessionScan {
     let mut scan = SessionScan::default();
-    let mut search_chunks = Vec::new();
 
     let Ok(file) = File::open(filepath) else {
         return scan;
     };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
 
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut line = String::new();
+    let mut line_no = 0usize;
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        line_no += 1;
+
+        // Past the header window, only parse lines that mention a content-bearing
+        // entry type. This skips ~99% of lines in progress-heavy sessions.
+        if line_no > HEADER_SCAN_LINES && !line_mentions_content_type(line.as_bytes()) {
+            continue;
+        }
+
         let entry: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -287,13 +308,13 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
         match entry_type {
             Some("summary") => {
                 if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
-                    scan.summary = Some(s.to_string());
+                    scan.summary = Some(s.to_owned());
                 }
                 continue;
             }
             Some("custom-title") => {
                 if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
-                    scan.custom_title = Some(t.to_string());
+                    scan.custom_title = Some(t.to_owned());
                 }
                 continue;
             }
@@ -301,11 +322,7 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
                 // Empty string = explicit removal. Missing field = malformed,
                 // preserve existing (matches summary/custom-title semantics).
                 if let Some(t) = entry.get("tag").and_then(|v| v.as_str()) {
-                    scan.tag = if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    };
+                    scan.tag = (!t.is_empty()).then(|| t.to_owned());
                 }
                 continue;
             }
@@ -315,7 +332,7 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
         if scan.project_path.is_empty()
             && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
         {
-            scan.project_path = cwd.to_string();
+            scan.project_path = cwd.to_owned();
         }
 
         if scan.forked_from.is_none()
@@ -324,7 +341,7 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
                 .and_then(|f| f.get("sessionId"))
                 .and_then(|v| v.as_str())
         {
-            scan.forked_from = Some(parent_id.to_string());
+            scan.forked_from = Some(parent_id.to_owned());
         }
 
         // isMeta/isCompactSummary mark synthetic user messages (attachment
@@ -336,84 +353,107 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             continue;
         }
 
-        if entry_type == Some("user")
-            && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
-            && let Some(text) = extract_text_content(content)
-        {
-            if scan.first_prompt.is_none() && is_first_prompt_candidate(&text) {
-                scan.first_prompt = Some(crate::normalize_summary(&text, 50));
+        let is_user = entry_type == Some("user");
+        let content = match entry_type {
+            Some("user") | Some("assistant") => entry.get("message").and_then(|m| m.get("content")),
+            _ => None,
+        };
+        let Some(content) = content else { continue };
+
+        // Single traversal over content blocks feeds both first-prompt/turn
+        // logic (first text block) and search index (all text blocks).
+        let mut blocks = iter_text_blocks(content);
+        let Some(first) = blocks.next() else { continue };
+
+        if is_user {
+            if scan.first_prompt.is_none() && is_first_prompt_candidate(first) {
+                scan.first_prompt = Some(crate::normalize_summary(first, 50));
             }
-            if counts_as_turn(&text) {
+            if counts_as_turn(first) {
                 scan.turn_count += 1;
+            }
+            // Keep search index aligned with preview: skip system-tag user
+            // payloads so Ctrl+S matches only what the preview will show.
+            if is_system_content_for_preview(first) {
+                continue;
             }
         }
 
-        if matches!(entry_type, Some("user") | Some("assistant"))
-            && let Some(text) = extract_message_text_for_search(&entry)
-            && !text.is_empty()
-        {
-            // Keep search index aligned with preview: skip system-tag user
-            // payloads so Ctrl+S matches only what the preview will show.
-            if entry_type == Some("user") && is_system_content_for_preview(&text) {
-                continue;
-            }
-            search_chunks.push(text);
+        append_lowercase(&mut scan.search_text_lower, first);
+        for text in blocks {
+            append_lowercase(&mut scan.search_text_lower, text);
         }
     }
 
-    scan.search_text_lower = search_chunks.join("\n").to_lowercase();
+    scan.search_text_lower.shrink_to_fit();
     scan
 }
 
-/// Extract first text from message content (string or array of content blocks).
-/// Takes the `content` value directly (caller navigates to it).
-pub fn extract_text_content(content: &serde_json::Value) -> Option<String> {
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
+static TYPE_KEY_FINDER: LazyLock<memmem::Finder<'static>> =
+    LazyLock::new(|| memmem::Finder::new(br#""type":""#));
 
-    content.as_array()?.iter().find_map(|c| {
-        if c.get("type")?.as_str()? == "text" {
-            Some(c.get("text")?.as_str()?.to_string())
-        } else {
-            None
+/// Cheap scan for a content-bearing entry type. SIMD-accelerated walk of
+/// `"type":"` markers left to right; the entry-level type appears before any
+/// nested `data.type`, so the first hit usually decides the line. False
+/// positives are harmless — we'd just parse that line unnecessarily.
+pub fn line_mentions_content_type(line: &[u8]) -> bool {
+    let needle_len = TYPE_KEY_FINDER.needle().len();
+    let mut haystack = line;
+    while let Some(pos) = TYPE_KEY_FINDER.find(haystack) {
+        let after = &haystack[pos + needle_len..];
+        let is_content = match after.first() {
+            Some(&b'u') => after.starts_with(b"user\""),
+            Some(&b'a') => after.starts_with(b"assistant\""),
+            Some(&b's') => after.starts_with(b"summary\""),
+            Some(&b'c') => after.starts_with(b"custom-title\""),
+            Some(&b't') => after.starts_with(b"tag\""),
+            _ => false,
+        };
+        if is_content {
+            return true;
         }
-    })
+        haystack = after;
+    }
+    false
 }
 
-// =============================================================================
-// Transcript Search
-// =============================================================================
-
-/// Extract text from message content for search purposes.
-/// Unlike `extract_text_content` (which returns the first text block),
-/// this joins ALL text blocks — a search match could be in any block.
-fn extract_message_text_for_search(entry: &serde_json::Value) -> Option<String> {
-    let content = entry.get("message")?.get("content")?;
-
-    // Content can be a string or array of content blocks
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
+/// Append `text` to `buf` lowercased, separated by a newline. Avoids the
+/// intermediate `Vec<String>` + `join` + `to_lowercase` triple-allocation
+/// the previous implementation performed per file.
+fn append_lowercase(buf: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
     }
-
-    // For arrays, collect all text blocks
-    if let Some(arr) = content.as_array() {
-        let texts: Vec<String> = arr
-            .iter()
-            .filter_map(|c| {
-                if c.get("type")?.as_str()? == "text" {
-                    Some(c.get("text")?.as_str()?.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !texts.is_empty() {
-            return Some(texts.join(" "));
-        }
+    if !buf.is_empty() {
+        buf.push('\n');
     }
+    let start = buf.len();
+    buf.push_str(text);
+    // SAFETY: make_ascii_lowercase only flips bit 0x20 on uppercase ASCII and
+    // leaves all other bytes (including UTF-8 continuation bytes) untouched,
+    // so the buffer remains valid UTF-8. Non-ASCII uppercase is left as-is —
+    // a reasonable trade since Ctrl+S search compares against the user's own
+    // transcript text and the quadratic cost of full Unicode case-folding
+    // dominates on multi-GB corpora.
+    unsafe { buf.as_bytes_mut()[start..].make_ascii_lowercase() };
+}
 
-    None
+/// Iterate over all text blocks in a message content value (string or array
+/// of content blocks), borrowing from the underlying JSON.
+fn iter_text_blocks(content: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let single = content.as_str();
+    let blocks = content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|c| c.get("text").and_then(|v| v.as_str()));
+    single.into_iter().chain(blocks)
+}
+
+/// Extract the first text block from message content, borrowing from the JSON.
+pub fn first_text_block(content: &serde_json::Value) -> Option<&str> {
+    iter_text_blocks(content).next()
 }
 
 // =============================================================================
@@ -1012,6 +1052,67 @@ mod tests {
         assert!(!text.contains("deploy"));
         assert!(text.contains("api"));
         assert!(text.contains("answer"));
+    }
+
+    #[test]
+    fn line_filter_accepts_content_types() {
+        for ty in ["user", "assistant", "summary", "custom-title", "tag"] {
+            let line = format!(r#"{{"parentUuid":"x","type":"{ty}","cwd":"/tmp"}}"#);
+            assert!(line_mentions_content_type(line.as_bytes()), "type: {ty}");
+        }
+    }
+
+    #[test]
+    fn line_filter_rejects_progress_types() {
+        for ty in [
+            "progress",
+            "attachment",
+            "system",
+            "mode",
+            "queue-operation",
+        ] {
+            let line = format!(r#"{{"type":"{ty}","data":{{"type":"sleep_progress"}}}}"#);
+            assert!(!line_mentions_content_type(line.as_bytes()), "type: {ty}");
+        }
+    }
+
+    #[test]
+    fn line_filter_nested_type_ignored() {
+        // A progress entry with a nested "type":"text" (not a content type) — skip.
+        let line = br#"{"type":"progress","data":{"type":"text"}}"#;
+        assert!(!line_mentions_content_type(line));
+        // But a progress line carrying a nested "type":"user" is a false
+        // positive we accept (harmless — we'd just parse it).
+        let fp = br#"{"type":"progress","data":{"type":"user"}}"#;
+        assert!(line_mentions_content_type(fp));
+    }
+
+    #[test]
+    fn scan_filter_still_parses_header_lines() {
+        // progress lines past HEADER_SCAN_LINES are skipped, but the first few
+        // still feed cwd/forkedFrom/isSidechain detection.
+        let mut content = String::new();
+        content.push_str(
+            r#"{"type":"progress","cwd":"/proj","isSidechain":false,"forkedFrom":{"sessionId":"p"}}"#,
+        );
+        content.push('\n');
+        // pile of skippable progress
+        for _ in 0..100 {
+            content.push_str(r#"{"type":"progress","data":{"type":"sleep"}}"#);
+            content.push('\n');
+        }
+        content.push_str(r#"{"type":"user","message":{"role":"user","content":"hello"}}"#);
+        content.push('\n');
+        content.push_str(r#"{"type":"summary","summary":"Done"}"#);
+        content.push('\n');
+
+        let (_tmp, path) = scan_fixture(&content);
+        let scan = scan_session_file(&path);
+        assert_eq!(scan.project_path, "/proj");
+        assert_eq!(scan.forked_from, Some("p".to_string()));
+        assert_eq!(scan.first_prompt, Some("hello".to_string()));
+        assert_eq!(scan.summary, Some("Done".to_string()));
+        assert_eq!(scan.turn_count, 1);
     }
 
     #[test]
