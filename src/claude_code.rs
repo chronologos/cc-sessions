@@ -233,7 +233,6 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
         turn_count: scan.turn_count,
         source: source.clone(),
         forked_from: scan.forked_from,
-        search_text_lower: scan.search_text_lower,
     })
 }
 
@@ -244,7 +243,6 @@ struct SessionScan {
     first_prompt: Option<String>,
     forked_from: Option<String>,
     turn_count: usize,
-    search_text_lower: String,
     summary: Option<String>,
     custom_title: Option<String>,
     tag: Option<String>,
@@ -257,7 +255,7 @@ struct SessionScan {
 /// every entry, so it is reliably present within the first handful of lines.
 const HEADER_SCAN_LINES: usize = 16;
 
-/// Scan a session file once to collect all metadata, turn count, and search text.
+/// Scan a session file once to collect all metadata and turn count.
 ///
 /// Single file open, single pass. After the first `HEADER_SCAN_LINES` lines,
 /// a cheap byte-level check skips lines that cannot contribute content (the
@@ -353,6 +351,69 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
             continue;
         }
 
+        if entry_type == Some("user")
+            && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
+            && let Some(first) = iter_text_blocks(content).next()
+        {
+            if scan.first_prompt.is_none() && is_first_prompt_candidate(first) {
+                scan.first_prompt = Some(crate::normalize_summary(first, 50));
+            }
+            if counts_as_turn(first) {
+                scan.turn_count += 1;
+            }
+        }
+    }
+
+    scan
+}
+
+// =============================================================================
+// Search Index (built lazily, off the discovery hot path)
+// =============================================================================
+
+/// Lowercase transcript text keyed by session ID, for Ctrl+S filtering.
+pub type SearchIndex = std::collections::HashMap<String, String>;
+
+/// Build the transcript search index for the given sessions in parallel.
+/// Intended to run on a background thread after the picker has rendered.
+pub fn build_search_index(targets: Vec<(String, PathBuf)>) -> SearchIndex {
+    targets
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|(id, path)| (id, scan_search_text(&path)))
+        .collect()
+}
+
+/// Extract lowercase transcript text from a single session file.
+fn scan_search_text(filepath: &Path) -> String {
+    let Ok(file) = File::open(filepath) else {
+        return String::new();
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut line = String::new();
+    let mut out = String::new();
+
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+        if !line_mentions_content_type(line.as_bytes()) {
+            line.clear();
+            continue;
+        }
+        let entry: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => {
+                line.clear();
+                continue;
+            }
+        };
+        line.clear();
+
+        if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            || entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
+        {
+            continue;
+        }
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
         let is_user = entry_type == Some("user");
         let content = match entry_type {
             Some("user") | Some("assistant") => entry.get("message").and_then(|m| m.get("content")),
@@ -360,33 +421,23 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
         };
         let Some(content) = content else { continue };
 
-        // Single traversal over content blocks feeds both first-prompt/turn
-        // logic (first text block) and search index (all text blocks).
         let mut blocks = iter_text_blocks(content);
         let Some(first) = blocks.next() else { continue };
 
-        if is_user {
-            if scan.first_prompt.is_none() && is_first_prompt_candidate(first) {
-                scan.first_prompt = Some(crate::normalize_summary(first, 50));
-            }
-            if counts_as_turn(first) {
-                scan.turn_count += 1;
-            }
-            // Keep search index aligned with preview: skip system-tag user
-            // payloads so Ctrl+S matches only what the preview will show.
-            if is_system_content_for_preview(first) {
-                continue;
-            }
+        // Keep search index aligned with preview: skip system-tag user
+        // payloads so Ctrl+S matches only what the preview will show.
+        if is_user && is_system_content_for_preview(first) {
+            continue;
         }
 
-        append_lowercase(&mut scan.search_text_lower, first);
+        append_lowercase(&mut out, first);
         for text in blocks {
-            append_lowercase(&mut scan.search_text_lower, text);
+            append_lowercase(&mut out, text);
         }
     }
 
-    scan.search_text_lower.shrink_to_fit();
-    scan
+    out.shrink_to_fit();
+    out
 }
 
 static TYPE_KEY_FINDER: LazyLock<memmem::Finder<'static>> =
@@ -512,6 +563,10 @@ mod tests {
         let path = tmp.path().join("test.jsonl");
         fs::write(&path, content).unwrap();
         (tmp, path)
+    }
+
+    fn scan(path: &Path) -> SessionScan {
+        scan_session_file(path)
     }
 
     /// Create a temp projects dir with a single UUID-named session file.
@@ -787,10 +842,7 @@ mod tests {
 {"type":"assistant","message":"hi"}
 {"type":"user","message":{"role":"user","content":"later"},"forkedFrom":{"sessionId":"parent-2","messageUuid":"m2"}}"#,
         );
-        assert_eq!(
-            scan_session_file(&path).forked_from,
-            Some("parent-1".to_string())
-        );
+        assert_eq!(scan(&path).forked_from, Some("parent-1".to_string()));
     }
 
     #[test]
@@ -801,7 +853,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"hello"},"forkedFrom":{"sessionId":"parent-session-id","messageUuid":"msg1"}}
 {"type":"assistant","message":"hi"}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert_eq!(scan.project_path, "/Users/test/project");
         assert_eq!(scan.forked_from, Some("parent-session-id".to_string()));
         assert_eq!(scan.first_prompt, Some("hello".to_string()));
@@ -819,7 +871,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"What is Rust?"}}
 {"type":"assistant","message":{"role":"assistant","content":"A programming language."}}"#,
         );
-        assert_eq!(scan_session_file(&path).turn_count, 2);
+        assert_eq!(scan(&path).turn_count, 2);
     }
 
     #[test]
@@ -832,7 +884,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"[some bracketed thing]"}}
 {"type":"user","message":{"role":"user","content":"Another real message"}}"#,
         );
-        assert_eq!(scan_session_file(&path).turn_count, 2);
+        assert_eq!(scan(&path).turn_count, 2);
     }
 
     #[test]
@@ -842,13 +894,13 @@ mod tests {
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/init</command-name>"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Real question?"}]}}"#,
         );
-        assert_eq!(scan_session_file(&path).turn_count, 2);
+        assert_eq!(scan(&path).turn_count, 2);
     }
 
     #[test]
     fn count_turns_empty_file() {
         let (_tmp, path) = scan_fixture("");
-        assert_eq!(scan_session_file(&path).turn_count, 0);
+        assert_eq!(scan(&path).turn_count, 0);
     }
 
     #[test]
@@ -857,7 +909,7 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":"[tool output that is not Request]"},"cwd":"/Users/test/project"}
 {"type":"user","message":{"role":"user","content":"Real user question"}}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         // first prompt excludes [Request... but not all bracketed text
         assert_eq!(
             scan.first_prompt,
@@ -906,7 +958,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"/help"}}
 {"type":"user","message":{"role":"user","content":"Second real prompt"}}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert_eq!(scan.project_path, "/Users/test/project");
         assert_eq!(scan.first_prompt, Some("Real prompt".to_string()));
         assert_eq!(scan.turn_count, 2);
@@ -922,7 +974,7 @@ mod tests {
         let session_path = root
             .join("-Users-test-proj")
             .join(format!("{}.jsonl", test_uuid(50)));
-        assert!(scan_session_file(&session_path).skip);
+        assert!(scan(&session_path).skip);
         assert_eq!(find_sessions(&root).unwrap().len(), 0);
     }
 
@@ -931,7 +983,7 @@ mod tests {
         let (_tmp, path) = scan_fixture(
             r#"{"type":"user","message":{"role":"user","content":"hi"},"cwd":"/tmp","isSidechain":false}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert!(!scan.skip);
         assert_eq!(scan.project_path, "/tmp");
     }
@@ -946,7 +998,7 @@ mod tests {
         let session_path = root
             .join("-Users-test-proj")
             .join(format!("{}.jsonl", test_uuid(51)));
-        assert!(scan_session_file(&session_path).skip);
+        assert!(scan(&session_path).skip);
         assert_eq!(find_sessions(&root).unwrap().len(), 0);
     }
 
@@ -956,11 +1008,11 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":"synthetic attachment context"},"cwd":"/tmp","isMeta":true}
 {"type":"user","message":{"role":"user","content":"real user prompt"}}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert_eq!(scan.project_path, "/tmp");
         assert_eq!(scan.first_prompt, Some("real user prompt".to_string()));
         assert_eq!(scan.turn_count, 1);
-        assert!(!scan.search_text_lower.contains("synthetic"));
+        assert!(!scan_search_text(&path).contains("synthetic"));
     }
 
     #[test]
@@ -969,7 +1021,7 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":"This session covers X and Y"},"cwd":"/tmp","isCompactSummary":true}
 {"type":"user","message":{"role":"user","content":"actual question"}}"#,
         );
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert_eq!(scan.first_prompt, Some("actual question".to_string()));
         assert_eq!(scan.turn_count, 1);
     }
@@ -981,10 +1033,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"more work"},"cwd":"/tmp"}
 {"type":"summary","summary":"Final summary"}"#,
         );
-        assert_eq!(
-            scan_session_file(&path).summary,
-            Some("Final summary".to_string())
-        );
+        assert_eq!(scan(&path).summary, Some("Final summary".to_string()));
     }
 
     #[test]
@@ -993,7 +1042,7 @@ mod tests {
             r#"{"type":"summary","summary":"Valid"}
 {"type":"summary"}"#,
         );
-        assert_eq!(scan_session_file(&path).summary, Some("Valid".to_string()));
+        assert_eq!(scan(&path).summary, Some("Valid".to_string()));
     }
 
     #[test]
@@ -1004,20 +1053,17 @@ mod tests {
 {"type":"assistant","message":{"role":"assistant","content":"hi"}}
 {"type":"custom-title","customTitle":"New Name","sessionId":"x"}"#,
         );
-        assert_eq!(
-            scan_session_file(&path).custom_title,
-            Some("New Name".to_string())
-        );
+        assert_eq!(scan(&path).custom_title, Some("New Name".to_string()));
     }
 
     #[test]
-    fn scan_search_text_includes_user_and_assistant_text() {
+    fn search_text_includes_user_and_assistant_text() {
         let (_tmp, path) = scan_fixture(
             r#"{"type":"user","message":{"role":"user","content":"API status"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Service healthy"}]}}
 {"type":"summary","summary":"ignored summary"}"#,
         );
-        let text = scan_session_file(&path).search_text_lower;
+        let text = scan_search_text(&path);
         assert!(text.contains("api status"));
         assert!(text.contains("service healthy"));
     }
@@ -1029,7 +1075,7 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"work"},"cwd":"/tmp"}
 {"type":"tag","tag":"","sessionId":"x"}"#,
         );
-        assert_eq!(scan_session_file(&path).tag, None);
+        assert_eq!(scan(&path).tag, None);
     }
 
     #[test]
@@ -1038,17 +1084,17 @@ mod tests {
             r#"{"type":"tag","tag":"important","sessionId":"x"}
 {"type":"tag","sessionId":"x"}"#,
         );
-        assert_eq!(scan_session_file(&path).tag, Some("important".to_string()));
+        assert_eq!(scan(&path).tag, Some("important".to_string()));
     }
 
     #[test]
-    fn scan_search_text_excludes_system_tag_user_content() {
+    fn search_text_excludes_system_tag_user_content() {
         let (_tmp, path) = scan_fixture(
             r#"{"type":"user","message":{"role":"user","content":"<command-message>deploy</command-message>"},"cwd":"/tmp"}
 {"type":"user","message":{"role":"user","content":"real question about API"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
         );
-        let text = scan_session_file(&path).search_text_lower;
+        let text = scan_search_text(&path);
         assert!(!text.contains("deploy"));
         assert!(text.contains("api"));
         assert!(text.contains("answer"));
@@ -1107,7 +1153,7 @@ mod tests {
         content.push('\n');
 
         let (_tmp, path) = scan_fixture(&content);
-        let scan = scan_session_file(&path);
+        let scan = scan(&path);
         assert_eq!(scan.project_path, "/proj");
         assert_eq!(scan.forked_from, Some("p".to_string()));
         assert_eq!(scan.first_prompt, Some("hello".to_string()));
@@ -1121,6 +1167,6 @@ mod tests {
             r#"{"type":"tag","tag":"old","sessionId":"x"}
 {"type":"tag","tag":"new","sessionId":"x"}"#,
         );
-        assert_eq!(scan_session_file(&path).tag, Some("new".to_string()));
+        assert_eq!(scan(&path).tag, Some("new".to_string()));
     }
 }

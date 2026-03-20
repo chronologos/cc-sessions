@@ -84,7 +84,7 @@ All metadata is extracted directly from `.jsonl` files (no index dependency):
 
 1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
 2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
-3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, lowercase searchable transcript text, last `summary` entry, last `custom-title` entry, skip flags
+3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, last `summary`/`custom-title`/`tag` entries, skip flags
 4. **Timestamps** from filesystem (created, modified)
 5. **Filter out** sidechain/teammate sessions and empty sessions (no cwd, no user message, no summary)
 
@@ -219,7 +219,7 @@ Ctrl+S performs literal full-text search across session transcripts and **replac
 
 **Design choice**: Search replaces the view temporarily rather than filtering within the current subtree. This ensures you can find any session regardless of navigation state. The search results persist until explicitly cleared with Esc.
 
-**Performance note**: Lowercase transcript text is built during discovery and stored on each `Session`, so Ctrl+S is a simple in-memory filter with no additional I/O.
+**Performance note**: The lowercase transcript index is built on a background thread after the picker renders (not during discovery), so startup stays fast and list mode never pays the memory cost. First Ctrl+S joins the thread — typically already finished by the time the user has typed a query.
 
 ```
 Normal View                  After Ctrl+S "api"

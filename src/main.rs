@@ -1002,6 +1002,20 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let children_map = build_fork_tree(sessions);
 
+    // Kick off the transcript search index on a background thread so the picker
+    // renders immediately. By the time the user has typed a query and hit
+    // Ctrl+S the index is almost certainly ready; if not, the join blocks
+    // briefly. Memory stays low for list mode and for interactive mode until
+    // the index actually materializes.
+    let index_targets: Vec<(String, PathBuf)> = sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.filepath.clone()))
+        .collect();
+    let mut index_handle = Some(std::thread::spawn(move || {
+        claude_code::build_search_index(index_targets)
+    }));
+    let mut search_index: Option<claude_code::SearchIndex> = None;
+
     let mut state = InteractiveState::default();
 
     loop {
@@ -1083,13 +1097,20 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             let StateEffect::RunSearch { pattern } = effect else {
                 continue;
             };
+            // Materialize the background index on first search.
+            let index = search_index.get_or_insert_with(|| {
+                index_handle
+                    .take()
+                    .and_then(|h| h.join().ok())
+                    .unwrap_or_default()
+            });
             // Index is built with make_ascii_lowercase(); fold the query the
             // same way so non-ASCII letters compare identically on both sides.
             let pattern_lower = pattern.to_ascii_lowercase();
-            let matched_ids: std::collections::HashSet<String> = sessions
+            let matched_ids: std::collections::HashSet<String> = index
                 .iter()
-                .filter(|s| s.search_text_lower.contains(&pattern_lower))
-                .map(|s| s.id.clone())
+                .filter(|(_, text)| text.contains(&pattern_lower))
+                .map(|(id, _)| id.clone())
                 .collect();
             let _ = state.apply(StateAction::ApplySearchResults {
                 pattern,
@@ -1304,7 +1325,6 @@ mod tests {
             turn_count: 1,
             source: SessionSource::Local,
             forked_from: None,
-            search_text_lower: String::new(),
         }
     }
 

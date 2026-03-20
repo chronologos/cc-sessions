@@ -47,5 +47,4 @@ pub struct Session {
     pub turn_count: usize,       // Number of user messages (conversation turns)
     pub source: SessionSource,   // Where this session came from
     pub forked_from: Option<String>, // Parent session ID if this is a fork
-    pub search_text_lower: String, // Lowercase transcript text for Ctrl+S search
 }
