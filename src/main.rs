@@ -929,12 +929,47 @@ fn format_session_row_simple(
     };
     let msgs = format!("{:>3}", session.turn_count);
 
+    // PROJECT column is fixed at 12 chars so FIXED_COLS arithmetic holds.
+    // Long project names are middle-elided (keeps both prefix and suffix
+    // readable — `claude-cli-internal` → `claud…ternal`).
+    let project = elide_middle(&session.project, 12);
+
     let desc = format_session_desc(session, desc_width);
+    // Named sessions (via /rename) get bold+yellow so they stand out in the
+    // picker. Requires .ansi(true) on the skim options.
+    let desc = if session.name.is_some() {
+        format!(
+            "{}{}{}{}",
+            colors::BOLD,
+            colors::YELLOW,
+            desc,
+            colors::RESET
+        )
+    } else {
+        desc
+    };
 
     format!(
         "{}{}{:<4} {:<4} {} {:<6} {:<12} {}",
-        prefix, id_prefix, created, modified, msgs, source, session.project, desc,
+        prefix, id_prefix, created, modified, msgs, source, project, desc,
     )
+}
+
+/// Middle-elide a string to at most `max` chars. Keeps roughly equal head and
+/// tail, inserts `…` between them. Returns a `Cow` to avoid allocating when
+/// the input already fits.
+fn elide_middle(s: &str, max: usize) -> Cow<'_, str> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return Cow::Borrowed(s);
+    }
+    let head = (max - 1) / 2;
+    let tail = max - 1 - head;
+    let mut out = String::with_capacity(max);
+    out.extend(&chars[..head]);
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    Cow::Owned(out)
 }
 
 /// Available width for the SUMMARY column given the list pane width.
@@ -1042,6 +1077,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
 
         let options = SkimOptionsBuilder::default()
             .height("100%")
+            .ansi(true)
             .preview("") // enables preview pane
             .preview_window("right:50%:wrap")
             .header(&header)
@@ -1470,6 +1506,22 @@ mod tests {
         assert!(row.contains("abcde"));
         // Should contain the prefix
         assert!(row.starts_with("▶ "));
+    }
+
+    #[test]
+    fn elide_middle_passthrough_when_fits() {
+        assert_eq!(elide_middle("short", 12), "short");
+        assert_eq!(elide_middle("exactly-12ch", 12), "exactly-12ch");
+    }
+
+    #[test]
+    fn elide_middle_shortens_long_names() {
+        let out = elide_middle("claude-cli-internal", 12);
+        assert_eq!(out.chars().count(), 12);
+        assert!(out.contains('…'));
+        // Keeps head and tail readable
+        assert!(out.starts_with("claud"));
+        assert!(out.ends_with("ternal"));
     }
 
     #[test]
