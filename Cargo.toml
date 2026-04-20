@@ -1,20 +1,20 @@
 [package]
 name = "cc-sessions"
-version = "1.8.0"
+version = "1.8.1"
 edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 dirs = "6"
 walkdir = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 memchr = "2"
-skim = { version = "3", default-features = false }
+skim = { version = "4", default-features = false }
 ratatui = { version = "0.30", default-features = false }
 crossterm = "0.29"
 shellexpand = "3"
