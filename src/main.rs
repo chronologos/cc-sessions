@@ -20,6 +20,7 @@ use std::time::SystemTime;
 #[derive(Parser)]
 #[command(
     name = "cc-sessions",
+    version,
     about = "List and resume Claude Code sessions across projects and machines"
 )]
 struct Args {
