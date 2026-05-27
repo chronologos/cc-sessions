@@ -27,6 +27,7 @@ use memchr::memmem;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
@@ -118,7 +119,9 @@ pub fn find_all_sessions_with_summary(
         }
     }
 
-    summary.sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    summary
+        .sessions
+        .sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(summary)
 }
 
@@ -130,7 +133,7 @@ pub fn find_all_sessions_with_summary(
 #[cfg(test)]
 pub fn find_sessions(projects_dir: &Path) -> Result<Vec<Session>> {
     let mut sessions = find_sessions_with_source(projects_dir, SessionSource::Local)?;
-    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(sessions)
 }
 
@@ -255,19 +258,113 @@ struct SessionScan {
 /// every entry, so it is reliably present within the first handful of lines.
 const HEADER_SCAN_LINES: usize = 16;
 
-/// Scan a session file once to collect all metadata and turn count.
+/// Whether an entry is a synthetic user message (attachment context, proactive
+/// ticks, post-compaction summaries) rather than real user input. Such entries
+/// still carry session-level metadata (cwd, forkedFrom), but their content is
+/// excluded from first-prompt, turn-count, and search text.
+fn is_synthetic_entry(entry: &serde_json::Value) -> bool {
+    entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+        || entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
+}
+
+impl SessionScan {
+    /// Fold one raw transcript line (1-based `line_no`) into the accumulator.
+    ///
+    /// This is the pure, I/O-free core of the session scanner: it borrows the
+    /// line only for the duration of the call, so the caller can drive it with a
+    /// single reused read buffer (zero per-line allocation) or, in tests, with a
+    /// plain `&str` split into lines. `ControlFlow::Break` signals an early stop
+    /// (the session is a sidechain/teammate transcript we discard wholesale).
+    fn ingest_line(&mut self, line: &str, line_no: usize) -> ControlFlow<()> {
+        // Past the header window, only parse lines that mention a content-bearing
+        // entry type. This skips ~99% of lines in progress-heavy sessions.
+        if line_no > HEADER_SCAN_LINES && !line_mentions_content_type(line.as_bytes()) {
+            return ControlFlow::Continue(());
+        }
+
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return ControlFlow::Continue(()),
+        };
+
+        // Sidechain (subagent) and teammate (swarm) sessions can both land in
+        // the main project dir as UUID-named files. Bail early — they can be
+        // large and we're discarding them anyway.
+        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+            || entry.get("teamName").and_then(|v| v.as_str()).is_some()
+        {
+            self.skip = true;
+            return ControlFlow::Break(());
+        }
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str());
+
+        match entry_type {
+            Some("summary") => {
+                if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
+                    self.summary = Some(s.to_owned());
+                }
+                return ControlFlow::Continue(());
+            }
+            Some("custom-title") => {
+                if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
+                    self.custom_title = Some(t.to_owned());
+                }
+                return ControlFlow::Continue(());
+            }
+            Some("tag") => {
+                // Empty string = explicit removal. Missing field = malformed,
+                // preserve existing (matches summary/custom-title semantics).
+                if let Some(t) = entry.get("tag").and_then(|v| v.as_str()) {
+                    self.tag = (!t.is_empty()).then(|| t.to_owned());
+                }
+                return ControlFlow::Continue(());
+            }
+            _ => {}
+        }
+
+        if self.project_path.is_empty()
+            && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
+        {
+            self.project_path = cwd.to_owned();
+        }
+
+        if self.forked_from.is_none()
+            && let Some(parent_id) = entry
+                .get("forkedFrom")
+                .and_then(|f| f.get("sessionId"))
+                .and_then(|v| v.as_str())
+        {
+            self.forked_from = Some(parent_id.to_owned());
+        }
+
+        if is_synthetic_entry(&entry) {
+            return ControlFlow::Continue(());
+        }
+
+        if entry_type == Some("user")
+            && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
+            && let Some(first) = iter_text_blocks(content).next()
+        {
+            if self.first_prompt.is_none() && is_first_prompt_candidate(first) {
+                self.first_prompt = Some(crate::normalize_summary(first, 120));
+            }
+            if counts_as_turn(first) {
+                self.turn_count += 1;
+            }
+        }
+
+        ControlFlow::Continue(())
+    }
+}
+
+/// Scan transcript content from any buffered reader.
 ///
-/// Single file open, single pass. After the first `HEADER_SCAN_LINES` lines,
-/// a cheap byte-level check skips lines that cannot contribute content (the
-/// bulk of large sessions is `progress` chatter we never read).
-fn scan_session_file(filepath: &Path) -> SessionScan {
+/// This is the single production drive loop (line numbering, one reused line
+/// buffer, early stop) shared by the file shell and the unit tests, so both
+/// exercise identical semantics; only `File::open` differs between them.
+fn scan_from_reader(mut reader: impl BufRead) -> SessionScan {
     let mut scan = SessionScan::default();
-
-    let Ok(file) = File::open(filepath) else {
-        return scan;
-    };
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
-
     let mut line = String::new();
     let mut line_no = 0usize;
 
@@ -280,91 +377,21 @@ fn scan_session_file(filepath: &Path) -> SessionScan {
         }
         line_no += 1;
 
-        // Past the header window, only parse lines that mention a content-bearing
-        // entry type. This skips ~99% of lines in progress-heavy sessions.
-        if line_no > HEADER_SCAN_LINES && !line_mentions_content_type(line.as_bytes()) {
-            continue;
-        }
-
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Sidechain (subagent) and teammate (swarm) sessions can both land in
-        // the main project dir as UUID-named files. Bail early — they can be
-        // large and we're discarding them anyway.
-        if entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
-            || entry.get("teamName").and_then(|v| v.as_str()).is_some()
-        {
-            scan.skip = true;
-            return scan;
-        }
-
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-
-        match entry_type {
-            Some("summary") => {
-                if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
-                    scan.summary = Some(s.to_owned());
-                }
-                continue;
-            }
-            Some("custom-title") => {
-                if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
-                    scan.custom_title = Some(t.to_owned());
-                }
-                continue;
-            }
-            Some("tag") => {
-                // Empty string = explicit removal. Missing field = malformed,
-                // preserve existing (matches summary/custom-title semantics).
-                if let Some(t) = entry.get("tag").and_then(|v| v.as_str()) {
-                    scan.tag = (!t.is_empty()).then(|| t.to_owned());
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        if scan.project_path.is_empty()
-            && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
-        {
-            scan.project_path = cwd.to_owned();
-        }
-
-        if scan.forked_from.is_none()
-            && let Some(parent_id) = entry
-                .get("forkedFrom")
-                .and_then(|f| f.get("sessionId"))
-                .and_then(|v| v.as_str())
-        {
-            scan.forked_from = Some(parent_id.to_owned());
-        }
-
-        // isMeta/isCompactSummary mark synthetic user messages (attachment
-        // context, post-compaction summaries). They carry cwd/forkedFrom like
-        // any entry, but their content is never real user input.
-        if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
-            || entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
-        {
-            continue;
-        }
-
-        if entry_type == Some("user")
-            && let Some(content) = entry.get("message").and_then(|m| m.get("content"))
-            && let Some(first) = iter_text_blocks(content).next()
-        {
-            if scan.first_prompt.is_none() && is_first_prompt_candidate(first) {
-                scan.first_prompt = Some(crate::normalize_summary(first, 120));
-            }
-            if counts_as_turn(first) {
-                scan.turn_count += 1;
-            }
+        if scan.ingest_line(&line, line_no).is_break() {
+            break;
         }
     }
 
     scan
+}
+
+/// Scan a session file once to collect all metadata and turn count.
+/// Thin I/O shell over [`scan_from_reader`]: single file open, single pass.
+fn scan_session_file(filepath: &Path) -> SessionScan {
+    let Ok(file) = File::open(filepath) else {
+        return SessionScan::default();
+    };
+    scan_from_reader(BufReader::with_capacity(64 * 1024, file))
 }
 
 // =============================================================================
@@ -384,60 +411,71 @@ pub fn build_search_index(targets: Vec<(String, PathBuf)>) -> SearchIndex {
         .collect()
 }
 
-/// Extract lowercase transcript text from a single session file.
-fn scan_search_text(filepath: &Path) -> String {
-    let Ok(file) = File::open(filepath) else {
-        return String::new();
+/// Fold one raw transcript line into the lowercase search buffer.
+///
+/// Pure, I/O-free core of the search-index builder (mirrors
+/// [`SessionScan::ingest_line`]): borrows the line only for the call so the
+/// driver can reuse a single read buffer.
+fn ingest_search_line(out: &mut String, line: &str) {
+    if !line_mentions_content_type(line.as_bytes()) {
+        return;
+    }
+    let entry: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
     };
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+
+    if is_synthetic_entry(&entry) {
+        return;
+    }
+
+    let entry_type = entry.get("type").and_then(|v| v.as_str());
+    let is_user = entry_type == Some("user");
+    let content = match entry_type {
+        Some("user") | Some("assistant") => entry.get("message").and_then(|m| m.get("content")),
+        _ => None,
+    };
+    let Some(content) = content else { return };
+
+    let mut blocks = iter_text_blocks(content);
+    let Some(first) = blocks.next() else { return };
+
+    // Keep search index aligned with preview: skip system-tag user
+    // payloads so Ctrl+S matches only what the preview will show.
+    if is_user && is_system_content_for_preview(first) {
+        return;
+    }
+
+    append_lowercase(out, first);
+    for text in blocks {
+        append_lowercase(out, text);
+    }
+}
+
+/// Build lowercase search text from any buffered reader.
+///
+/// Single production drive loop shared by the file shell and the unit tests
+/// (see [`scan_from_reader`] for the rationale).
+fn search_text_from_reader(mut reader: impl BufRead) -> String {
     let mut line = String::new();
     let mut out = String::new();
 
     while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-        if !line_mentions_content_type(line.as_bytes()) {
-            line.clear();
-            continue;
-        }
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                line.clear();
-                continue;
-            }
-        };
+        ingest_search_line(&mut out, &line);
         line.clear();
-
-        if entry.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
-            || entry.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
-        {
-            continue;
-        }
-
-        let entry_type = entry.get("type").and_then(|v| v.as_str());
-        let is_user = entry_type == Some("user");
-        let content = match entry_type {
-            Some("user") | Some("assistant") => entry.get("message").and_then(|m| m.get("content")),
-            _ => None,
-        };
-        let Some(content) = content else { continue };
-
-        let mut blocks = iter_text_blocks(content);
-        let Some(first) = blocks.next() else { continue };
-
-        // Keep search index aligned with preview: skip system-tag user
-        // payloads so Ctrl+S matches only what the preview will show.
-        if is_user && is_system_content_for_preview(first) {
-            continue;
-        }
-
-        append_lowercase(&mut out, first);
-        for text in blocks {
-            append_lowercase(&mut out, text);
-        }
     }
 
     out.shrink_to_fit();
     out
+}
+
+/// Extract lowercase transcript text from a single session file.
+/// Thin I/O shell over [`search_text_from_reader`].
+fn scan_search_text(filepath: &Path) -> String {
+    let Ok(file) = File::open(filepath) else {
+        return String::new();
+    };
+    search_text_from_reader(BufReader::with_capacity(64 * 1024, file))
 }
 
 static TYPE_KEY_FINDER: LazyLock<memmem::Finder<'static>> =
@@ -447,7 +485,7 @@ static TYPE_KEY_FINDER: LazyLock<memmem::Finder<'static>> =
 /// `"type":"` markers left to right; the entry-level type appears before any
 /// nested `data.type`, so the first hit usually decides the line. False
 /// positives are harmless — we'd just parse that line unnecessarily.
-pub fn line_mentions_content_type(line: &[u8]) -> bool {
+fn line_mentions_content_type(line: &[u8]) -> bool {
     let needle_len = TYPE_KEY_FINDER.needle().len();
     let mut haystack = line;
     while let Some(pos) = TYPE_KEY_FINDER.find(haystack) {
@@ -503,8 +541,119 @@ fn iter_text_blocks(content: &serde_json::Value) -> impl Iterator<Item = &str> {
 }
 
 /// Extract the first text block from message content, borrowing from the JSON.
-pub fn first_text_block(content: &serde_json::Value) -> Option<&str> {
+fn first_text_block(content: &serde_json::Value) -> Option<&str> {
     iter_text_blocks(content).next()
+}
+
+// =============================================================================
+// Transcript Messages (input for preview/search rendering)
+// =============================================================================
+
+/// Role of a transcript message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// A displayable user/assistant message extracted from a session transcript.
+#[derive(Debug)]
+pub struct Message {
+    pub role: Role,
+    pub text: String,
+}
+
+/// How much of each message's text [`read_messages`] retains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextDetail {
+    /// Only the first line. The scrollback preview shows one line per message,
+    /// so cloning full bodies (which can be very large) would be wasted work
+    /// on skim's per-keystroke preview path.
+    FirstLine,
+    /// Full text. The search preview must match and display every line.
+    Full,
+}
+
+/// Fold one raw transcript line into the message list. Pure — no I/O.
+///
+/// Keeps only user/assistant entries with a text payload, and drops
+/// system-generated user payloads (slash commands, command tags,
+/// request-interrupt notices) so renderers operate on clean conversational
+/// text.
+fn ingest_message_line(messages: &mut Vec<Message>, line: &str, detail: TextDetail) {
+    if !line_mentions_content_type(line.as_bytes()) {
+        return;
+    }
+    let entry: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let role = match entry.get("type").and_then(|v| v.as_str()) {
+        Some("user") => Role::User,
+        Some("assistant") => Role::Assistant,
+        _ => return,
+    };
+
+    let Some(text) = entry
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(first_text_block)
+    else {
+        return;
+    };
+    if role == Role::User && is_system_content_for_preview(text) {
+        return;
+    }
+
+    let text = match detail {
+        TextDetail::FirstLine => text.lines().next().unwrap_or(text),
+        TextDetail::Full => text,
+    };
+    messages.push(Message {
+        role,
+        text: text.to_owned(),
+    });
+}
+
+/// Read user/assistant messages from transcript content (shared production
+/// loop for the file shell and tests).
+///
+/// `limit` caps how many displayable messages are returned: `Some(n)` stops
+/// reading after `n` (scrollback preview), `None` reads the whole transcript
+/// (search, which must find matches anywhere).
+pub fn read_messages_from_reader(
+    mut reader: impl BufRead,
+    limit: Option<usize>,
+    detail: TextDetail,
+) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let mut line = String::new();
+
+    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+        if limit.is_some_and(|lim| messages.len() >= lim) {
+            break;
+        }
+        ingest_message_line(&mut messages, &line, detail);
+        line.clear();
+    }
+
+    messages
+}
+
+/// Read user/assistant messages from a session transcript file.
+/// Thin I/O shell over [`read_messages_from_reader`].
+pub fn read_messages(
+    filepath: &Path,
+    limit: Option<usize>,
+    detail: TextDetail,
+) -> Result<Vec<Message>> {
+    let file = File::open(filepath).context("Could not open session file")?;
+    Ok(read_messages_from_reader(
+        BufReader::with_capacity(64 * 1024, file),
+        limit,
+        detail,
+    ))
 }
 
 // =============================================================================
@@ -556,17 +705,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Write JSONL content to a tempfile and return (guard, path).
-    /// The TempDir guard cleans up on drop — no manual remove_dir_all needed.
-    fn scan_fixture(content: &str) -> (TempDir, PathBuf) {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("test.jsonl");
-        fs::write(&path, content).unwrap();
-        (tmp, path)
+    /// Scan inline JSONL content through the production reader loop — no disk
+    /// I/O (a `&[u8]` is a `BufRead`), no duplicated test driver.
+    fn scan(content: &str) -> SessionScan {
+        scan_from_reader(content.as_bytes())
     }
 
-    fn scan(path: &Path) -> SessionScan {
-        scan_session_file(path)
+    /// Build search text from inline JSONL content via the production loop.
+    fn search_text_from_str(content: &str) -> String {
+        search_text_from_reader(content.as_bytes())
     }
 
     /// Create a temp projects dir with a single UUID-named session file.
@@ -837,23 +984,22 @@ mod tests {
 
     #[test]
     fn scan_prefers_first_forked_from() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"hello"},"forkedFrom":{"sessionId":"parent-1","messageUuid":"m1"}}
 {"type":"assistant","message":"hi"}
 {"type":"user","message":{"role":"user","content":"later"},"forkedFrom":{"sessionId":"parent-2","messageUuid":"m2"}}"#,
         );
-        assert_eq!(scan(&path).forked_from, Some("parent-1".to_string()));
+        assert_eq!(scan.forked_from, Some("parent-1".to_string()));
     }
 
     #[test]
     fn scan_extracts_forked_from_on_later_line() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"progress","data":"starting"}
 {"type":"progress","cwd":"/Users/test/project","data":"hook"}
 {"type":"user","message":{"role":"user","content":"hello"},"forkedFrom":{"sessionId":"parent-session-id","messageUuid":"msg1"}}
 {"type":"assistant","message":"hi"}"#,
         );
-        let scan = scan(&path);
         assert_eq!(scan.project_path, "/Users/test/project");
         assert_eq!(scan.forked_from, Some("parent-session-id".to_string()));
         assert_eq!(scan.first_prompt, Some("hello".to_string()));
@@ -865,18 +1011,18 @@ mod tests {
 
     #[test]
     fn count_turns_real_user_messages() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"Hello, how are you?"}}
 {"type":"assistant","message":{"role":"assistant","content":"I'm good!"}}
 {"type":"user","message":{"role":"user","content":"What is Rust?"}}
 {"type":"assistant","message":{"role":"assistant","content":"A programming language."}}"#,
         );
-        assert_eq!(scan(&path).turn_count, 2);
+        assert_eq!(scan.turn_count, 2);
     }
 
     #[test]
     fn count_turns_excludes_system_content() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"<command-message>init</command-message>"}}
 {"type":"user","message":{"role":"user","content":"Real message here"}}
 {"type":"user","message":{"role":"user","content":"<local-command-stdout>output</local-command-stdout>"}}
@@ -884,32 +1030,30 @@ mod tests {
 {"type":"user","message":{"role":"user","content":"[some bracketed thing]"}}
 {"type":"user","message":{"role":"user","content":"Another real message"}}"#,
         );
-        assert_eq!(scan(&path).turn_count, 2);
+        assert_eq!(scan.turn_count, 2);
     }
 
     #[test]
     fn count_turns_handles_content_blocks() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello from blocks"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/init</command-name>"}]}}
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Real question?"}]}}"#,
         );
-        assert_eq!(scan(&path).turn_count, 2);
+        assert_eq!(scan.turn_count, 2);
     }
 
     #[test]
     fn count_turns_empty_file() {
-        let (_tmp, path) = scan_fixture("");
-        assert_eq!(scan(&path).turn_count, 0);
+        assert_eq!(scan("").turn_count, 0);
     }
 
     #[test]
     fn first_prompt_and_turn_count_current_filter_behavior() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"[tool output that is not Request]"},"cwd":"/Users/test/project"}
 {"type":"user","message":{"role":"user","content":"Real user question"}}"#,
         );
-        let scan = scan(&path);
         // first prompt excludes [Request... but not all bracketed text
         assert_eq!(
             scan.first_prompt,
@@ -952,13 +1096,12 @@ mod tests {
 
     #[test]
     fn scan_once_produces_equivalent_session_metadata() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"Real prompt"},"cwd":"/Users/test/project"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"assistant reply"}]}}
 {"type":"user","message":{"role":"user","content":"/help"}}
 {"type":"user","message":{"role":"user","content":"Second real prompt"}}"#,
         );
-        let scan = scan(&path);
         assert_eq!(scan.project_path, "/Users/test/project");
         assert_eq!(scan.first_prompt, Some("Real prompt".to_string()));
         assert_eq!(scan.turn_count, 2);
@@ -966,135 +1109,134 @@ mod tests {
 
     #[test]
     fn scan_filters_sidechain_sessions() {
-        let (_tmp, root) = project_fixture(
-            "-Users-test-proj",
-            &test_uuid(50),
-            r#"{"type":"user","message":{"role":"user","content":"agent work"},"cwd":"/Users/test/proj","isSidechain":true}"#,
-        );
-        let session_path = root
-            .join("-Users-test-proj")
-            .join(format!("{}.jsonl", test_uuid(50)));
-        assert!(scan(&session_path).skip);
+        let content = r#"{"type":"user","message":{"role":"user","content":"agent work"},"cwd":"/Users/test/proj","isSidechain":true}"#;
+        // Pure: the line scanner flags the skip.
+        assert!(scan(content).skip);
+        // Integration: discovery drops the file entirely.
+        let (_tmp, root) = project_fixture("-Users-test-proj", &test_uuid(50), content);
         assert_eq!(find_sessions(&root).unwrap().len(), 0);
     }
 
     #[test]
+    fn ingest_line_break_short_circuits_remaining_lines() {
+        // The sidechain entry returns ControlFlow::Break; any content after it
+        // must never be folded into the accumulator.
+        let scan = scan(
+            r#"{"type":"user","message":{"role":"user","content":"agent work"},"isSidechain":true}
+{"type":"user","message":{"role":"user","content":"should be ignored"},"cwd":"/tmp"}"#,
+        );
+        assert!(scan.skip);
+        assert_eq!(scan.first_prompt, None);
+        assert!(scan.project_path.is_empty());
+    }
+
+    #[test]
     fn scan_ignores_sidechain_false() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"hi"},"cwd":"/tmp","isSidechain":false}"#,
         );
-        let scan = scan(&path);
         assert!(!scan.skip);
         assert_eq!(scan.project_path, "/tmp");
     }
 
     #[test]
     fn scan_filters_teammate_sessions() {
-        let (_tmp, root) = project_fixture(
-            "-Users-test-proj",
-            &test_uuid(51),
-            r#"{"type":"user","message":{"role":"user","content":"swarm work"},"cwd":"/tmp","teamName":"my-team","isSidechain":false}"#,
-        );
-        let session_path = root
-            .join("-Users-test-proj")
-            .join(format!("{}.jsonl", test_uuid(51)));
-        assert!(scan(&session_path).skip);
+        let content = r#"{"type":"user","message":{"role":"user","content":"swarm work"},"cwd":"/tmp","teamName":"my-team","isSidechain":false}"#;
+        // Pure: the line scanner flags the skip.
+        assert!(scan(content).skip);
+        // Integration: discovery drops the file entirely.
+        let (_tmp, root) = project_fixture("-Users-test-proj", &test_uuid(51), content);
         assert_eq!(find_sessions(&root).unwrap().len(), 0);
     }
 
     #[test]
     fn scan_skips_meta_entries_for_first_prompt_and_turns() {
-        let (_tmp, path) = scan_fixture(
-            r#"{"type":"user","message":{"role":"user","content":"synthetic attachment context"},"cwd":"/tmp","isMeta":true}
-{"type":"user","message":{"role":"user","content":"real user prompt"}}"#,
-        );
-        let scan = scan(&path);
+        let content = r#"{"type":"user","message":{"role":"user","content":"synthetic attachment context"},"cwd":"/tmp","isMeta":true}
+{"type":"user","message":{"role":"user","content":"real user prompt"}}"#;
+        let scan = scan(content);
         assert_eq!(scan.project_path, "/tmp");
         assert_eq!(scan.first_prompt, Some("real user prompt".to_string()));
         assert_eq!(scan.turn_count, 1);
-        assert!(!scan_search_text(&path).contains("synthetic"));
+        assert!(!search_text_from_str(content).contains("synthetic"));
     }
 
     #[test]
     fn scan_skips_compact_summary_entries() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"This session covers X and Y"},"cwd":"/tmp","isCompactSummary":true}
 {"type":"user","message":{"role":"user","content":"actual question"}}"#,
         );
-        let scan = scan(&path);
         assert_eq!(scan.first_prompt, Some("actual question".to_string()));
         assert_eq!(scan.turn_count, 1);
     }
 
     #[test]
     fn scan_takes_last_summary() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"summary","summary":"Early compaction"}
 {"type":"user","message":{"role":"user","content":"more work"},"cwd":"/tmp"}
 {"type":"summary","summary":"Final summary"}"#,
         );
-        assert_eq!(scan(&path).summary, Some("Final summary".to_string()));
+        assert_eq!(scan.summary, Some("Final summary".to_string()));
     }
 
     #[test]
     fn scan_keeps_valid_summary_when_later_entry_malformed() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"summary","summary":"Valid"}
 {"type":"summary"}"#,
         );
-        assert_eq!(scan(&path).summary, Some("Valid".to_string()));
+        assert_eq!(scan.summary, Some("Valid".to_string()));
     }
 
     #[test]
     fn scan_takes_last_custom_title() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"user","message":{"role":"user","content":"hello"},"cwd":"/tmp"}
 {"type":"custom-title","customTitle":"Old Name","sessionId":"x"}
 {"type":"assistant","message":{"role":"assistant","content":"hi"}}
 {"type":"custom-title","customTitle":"New Name","sessionId":"x"}"#,
         );
-        assert_eq!(scan(&path).custom_title, Some("New Name".to_string()));
+        assert_eq!(scan.custom_title, Some("New Name".to_string()));
     }
 
     #[test]
     fn search_text_includes_user_and_assistant_text() {
-        let (_tmp, path) = scan_fixture(
+        let text = search_text_from_str(
             r#"{"type":"user","message":{"role":"user","content":"API status"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Service healthy"}]}}
 {"type":"summary","summary":"ignored summary"}"#,
         );
-        let text = scan_search_text(&path);
         assert!(text.contains("api status"));
         assert!(text.contains("service healthy"));
     }
 
     #[test]
     fn scan_tag_empty_string_clears_previous() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"tag","tag":"important","sessionId":"x"}
 {"type":"user","message":{"role":"user","content":"work"},"cwd":"/tmp"}
 {"type":"tag","tag":"","sessionId":"x"}"#,
         );
-        assert_eq!(scan(&path).tag, None);
+        assert_eq!(scan.tag, None);
     }
 
     #[test]
     fn scan_tag_missing_field_preserves_previous() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"tag","tag":"important","sessionId":"x"}
 {"type":"tag","sessionId":"x"}"#,
         );
-        assert_eq!(scan(&path).tag, Some("important".to_string()));
+        assert_eq!(scan.tag, Some("important".to_string()));
     }
 
     #[test]
     fn search_text_excludes_system_tag_user_content() {
-        let (_tmp, path) = scan_fixture(
+        let text = search_text_from_str(
             r#"{"type":"user","message":{"role":"user","content":"<command-message>deploy</command-message>"},"cwd":"/tmp"}
 {"type":"user","message":{"role":"user","content":"real question about API"}}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
         );
-        let text = scan_search_text(&path);
         assert!(!text.contains("deploy"));
         assert!(text.contains("api"));
         assert!(text.contains("answer"));
@@ -1152,8 +1294,7 @@ mod tests {
         content.push_str(r#"{"type":"summary","summary":"Done"}"#);
         content.push('\n');
 
-        let (_tmp, path) = scan_fixture(&content);
-        let scan = scan(&path);
+        let scan = scan(&content);
         assert_eq!(scan.project_path, "/proj");
         assert_eq!(scan.forked_from, Some("p".to_string()));
         assert_eq!(scan.first_prompt, Some("hello".to_string()));
@@ -1163,10 +1304,48 @@ mod tests {
 
     #[test]
     fn scan_tag_takes_last_non_empty() {
-        let (_tmp, path) = scan_fixture(
+        let scan = scan(
             r#"{"type":"tag","tag":"old","sessionId":"x"}
 {"type":"tag","tag":"new","sessionId":"x"}"#,
         );
-        assert_eq!(scan(&path).tag, Some("new".to_string()));
+        assert_eq!(scan.tag, Some("new".to_string()));
+    }
+
+    // =========================================================================
+    // Transcript message reading (preview/search input)
+    // =========================================================================
+
+    const MESSAGES_FIXTURE: &str = r#"{"type":"user","message":{"role":"user","content":"first question\nwith a second line"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"long answer\nbody continues"}]}}
+{"type":"user","message":{"role":"user","content":"/help"}}
+{"type":"user","message":{"role":"user","content":"second question"}}"#;
+
+    #[test]
+    fn read_messages_full_keeps_bodies_and_skips_system_content() {
+        let messages =
+            read_messages_from_reader(MESSAGES_FIXTURE.as_bytes(), None, TextDetail::Full);
+        // The /help slash command is dropped; real messages keep full text.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[0].text, "first question\nwith a second line");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].text, "long answer\nbody continues");
+        assert_eq!(messages[2].text, "second question");
+    }
+
+    #[test]
+    fn read_messages_first_line_detail_truncates_bodies() {
+        let messages =
+            read_messages_from_reader(MESSAGES_FIXTURE.as_bytes(), None, TextDetail::FirstLine);
+        assert_eq!(messages[0].text, "first question");
+        assert_eq!(messages[1].text, "long answer");
+    }
+
+    #[test]
+    fn read_messages_limit_caps_collected_messages() {
+        let messages =
+            read_messages_from_reader(MESSAGES_FIXTURE.as_bytes(), Some(1), TextDetail::Full);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "first question\nwith a second line");
     }
 }

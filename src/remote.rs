@@ -132,12 +132,19 @@ pub fn get_remote_cache_dir(settings: &Settings, remote_name: &str) -> Result<Pa
     Ok(cache_base.join(remote_name))
 }
 
-/// Build SSH target string: "user@host" or just "host"
-pub fn ssh_target(remote: &RemoteConfig) -> String {
-    match &remote.user {
-        Some(user) => format!("{}@{}", user, remote.host),
-        None => remote.host.clone(),
+/// Format an SSH destination: "user@host", or bare host when no user is set
+/// (SSH config aliases carry their own user). Single source of truth for SSH
+/// target syntax — used for both rsync (sync) and resume (main.rs).
+pub fn format_ssh_target(host: &str, user: Option<&str>) -> String {
+    match user {
+        Some(user) => format!("{}@{}", user, host),
+        None => host.to_string(),
     }
+}
+
+/// Build SSH target string for a configured remote: "user@host" or just "host"
+pub fn ssh_target(remote: &RemoteConfig) -> String {
+    format_ssh_target(&remote.host, remote.user.as_deref())
 }
 
 /// Get the remote projects directory (or default ~/.claude/projects)
@@ -152,13 +159,40 @@ pub fn remote_projects_dir(remote: &RemoteConfig) -> &str {
 // Sync Operations
 // =============================================================================
 
-/// Sync a remote's sessions to local cache using rsync
+/// Build the rsync source spec for a remote: `[user@]host:<projects_dir>/`.
+/// The trailing slash matters — it copies directory *contents*, not the
+/// directory itself. Pure — no I/O.
+fn rsync_source(remote: &RemoteConfig) -> String {
+    format!("{}:{}/", ssh_target(remote), remote_projects_dir(remote))
+}
+
+/// Build the rsync argument list. Pure — no I/O — so the flag set (notably
+/// `--delete` plus the excludes that protect `*.lock` and the local staleness
+/// marker from deletion) is unit-testable without invoking rsync.
 ///
-/// Uses rsync with:
 /// - `-a`: Archive mode (preserves timestamps, permissions)
 /// - `-z`: Compression for transfer
 /// - `--delete`: Remove files deleted on remote
 /// - `-e ssh`: Use SSH transport
+fn rsync_args<'a>(source: &'a str, dest: &'a str) -> Vec<&'a str> {
+    vec![
+        "-az",
+        "--delete",
+        "-e",
+        "ssh",
+        "--exclude",
+        "*.lock", // Don't sync lock files
+        "--exclude",
+        LAST_SYNC_FILE, // Protect local staleness marker from --delete
+        source,
+        dest,
+    ]
+}
+
+/// Sync a remote's sessions to local cache using rsync.
+///
+/// Thin I/O shell: builds the source/arg specs via the pure [`rsync_source`] /
+/// [`rsync_args`], then spawns rsync.
 pub fn sync_remote(
     remote_name: &str,
     remote: &RemoteConfig,
@@ -170,29 +204,13 @@ pub fn sync_remote(
     fs::create_dir_all(&cache_dir)
         .with_context(|| format!("Failed to create cache dir: {}", cache_dir.display()))?;
 
-    let target = ssh_target(remote);
-    let remote_path = remote_projects_dir(remote);
-
-    // rsync source: user@host:~/.claude/projects/
-    // The trailing slash is important - it copies contents, not the directory itself
-    let source = format!("{}:{}/", target, remote_path);
+    let source = rsync_source(remote);
     let dest = format!("{}/", cache_dir.display());
 
     let start = std::time::Instant::now();
 
     let output = Command::new("rsync")
-        .args([
-            "-az",
-            "--delete",
-            "-e",
-            "ssh",
-            "--exclude",
-            "*.lock", // Don't sync lock files
-            "--exclude",
-            LAST_SYNC_FILE, // Protect local staleness marker from --delete
-            &source,
-            &dest,
-        ])
+        .args(rsync_args(&source, &dest))
         .output()
         .context("Failed to execute rsync")?;
 
@@ -420,6 +438,51 @@ stale_threshold = 7200
 
         assert_eq!(config.settings.cache_dir, "~/.cache/my-cache");
         assert_eq!(config.settings.stale_threshold, 7200);
+    }
+
+    #[test]
+    fn rsync_source_default_dir_trailing_slash() {
+        let remote = RemoteConfig {
+            host: "devbox".to_string(),
+            user: None,
+            projects_dir: None,
+        };
+        // Trailing slash copies contents, not the directory itself.
+        assert_eq!(rsync_source(&remote), "devbox:~/.claude/projects/");
+    }
+
+    #[test]
+    fn rsync_source_with_user_and_custom_dir() {
+        let remote = RemoteConfig {
+            host: "1.2.3.4".to_string(),
+            user: Some("ec2-user".to_string()),
+            projects_dir: Some("/srv/.claude/projects".to_string()),
+        };
+        assert_eq!(
+            rsync_source(&remote),
+            "ec2-user@1.2.3.4:/srv/.claude/projects/"
+        );
+    }
+
+    #[test]
+    fn rsync_args_have_delete_excludes_and_trailing_paths() {
+        let args = rsync_args("src/", "dst/");
+
+        // --delete must be present; the excludes must protect lock files and the
+        // local staleness marker from being deleted by --delete.
+        assert!(args.contains(&"--delete"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--exclude" && w[1] == "*.lock")
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--exclude" && w[1] == LAST_SYNC_FILE)
+        );
+        // SSH transport.
+        assert!(args.windows(2).any(|w| w[0] == "-e" && w[1] == "ssh"));
+        // Source and dest are the final two positional args, in order.
+        assert_eq!(&args[args.len() - 2..], &["src/", "dst/"]);
     }
 
     #[test]

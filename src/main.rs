@@ -4,13 +4,14 @@ mod message_classification;
 mod remote;
 mod session;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
+use claude_code::{Message, Role, TextDetail};
 use interactive_state::{Action as StateAction, Effect as StateEffect, InteractiveState};
 use session::{Session, SessionSource};
 use skim::prelude::*;
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 // =============================================================================
@@ -422,131 +423,57 @@ mod colors {
 
 /// Print formatted transcript preview for a session file.
 /// Used internally by skim's preview command.
-fn print_session_preview(filepath: &PathBuf) -> Result<()> {
+fn print_session_preview(filepath: &Path) -> Result<()> {
     let content = generate_preview_content(filepath)?;
     print!("{}", content);
     Ok(())
 }
 
-/// Extract first text block from a message entry, borrowing from the JSON value
-fn extract_message_text(entry: &serde_json::Value) -> Option<&str> {
-    let content = entry.get("message")?.get("content")?;
-    claude_code::first_text_block(content)
-}
-
-/// Generate preview content as a string (for skim's preview pane). Skim is
-/// configured with `:wrap`, so we emit untruncated lines and let the pane
-/// handle overflow — no arbitrary width caps.
-fn generate_preview_content(filepath: &PathBuf) -> Result<String> {
+/// Render the scrollback preview: one line per message, first text line only.
+/// Pure — operates entirely on already-read messages.
+fn render_preview(messages: &[Message]) -> String {
     use std::fmt::Write as _;
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = File::open(filepath).context("Could not open session file")?;
-    let mut reader = BufReader::new(file);
 
     let mut output = String::new();
-    let mut line = String::new();
-    let mut line_count = 0;
-    const MAX_LINES: usize = 100;
-
-    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-        if line_count >= MAX_LINES {
-            break;
-        }
-        if !claude_code::line_mentions_content_type(line.as_bytes()) {
-            line.clear();
-            continue;
-        }
-
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                line.clear();
-                continue;
-            }
+    for msg in messages {
+        let (glyph, color) = match msg.role {
+            Role::User => ('U', colors::CYAN),
+            Role::Assistant => ('A', colors::YELLOW),
         };
-        line.clear();
-
-        let (role_glyph, color) = match entry.get("type").and_then(|v| v.as_str()) {
-            Some("user") => ('U', colors::CYAN),
-            Some("assistant") => ('A', colors::YELLOW),
-            _ => continue,
-        };
-
-        let Some(text) = extract_message_text(&entry) else {
-            continue;
-        };
-        if role_glyph == 'U' && is_system_content(text) {
-            continue;
-        }
-
-        let first_line = text.lines().next().unwrap_or(text);
-        let _ = writeln!(output, "{color}{role_glyph}: {first_line}{}", colors::RESET);
-        line_count += 1;
+        let first_line = msg.text.lines().next().unwrap_or(&msg.text);
+        let _ = writeln!(output, "{color}{glyph}: {first_line}{}", colors::RESET);
     }
 
     if output.is_empty() {
         output.push_str("(empty session)");
     }
 
-    Ok(output)
+    output
 }
 
-/// Check if content is system/XML content that should be skipped in previews
-fn is_system_content(text: &str) -> bool {
-    message_classification::is_system_content_for_preview(text)
+/// Generate preview content as a string (for skim's preview pane). Skim is
+/// configured with `:wrap`, so we emit untruncated lines and let the pane
+/// handle overflow — no arbitrary width caps. Reads only first lines (the
+/// preview shows one line per message) so large message bodies are never
+/// cloned on skim's per-keystroke preview path.
+fn generate_preview_content(filepath: &Path) -> Result<String> {
+    const MAX_MESSAGES: usize = 100;
+    let messages = claude_code::read_messages(filepath, Some(MAX_MESSAGES), TextDetail::FirstLine)?;
+    Ok(render_preview(&messages))
 }
 
-/// A message from the transcript
-struct Message {
-    role: String, // "user" or "assistant"
-    text: String,
+/// Generate preview showing matching messages with full conversation context.
+/// Thin I/O shell over [`claude_code::read_messages`] + [`render_search_preview`].
+fn generate_search_preview(filepath: &Path, pattern: &str) -> Result<String> {
+    // Search must find matches anywhere, so read the whole transcript (no cap).
+    let messages = claude_code::read_messages(filepath, None, TextDetail::Full)?;
+    Ok(render_search_preview(&messages, pattern))
 }
 
-/// Generate preview showing matching messages with full conversation context
-fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let file = File::open(filepath).context("Could not open session file")?;
-    let mut reader = BufReader::new(file);
-
-    // Collect all messages first (filter out progress/attachment lines before
-    // the JSON parse — large sessions are dominated by those).
-    let mut messages: Vec<Message> = Vec::new();
-    let mut line = String::new();
-    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
-        if !claude_code::line_mentions_content_type(line.as_bytes()) {
-            line.clear();
-            continue;
-        }
-        let entry: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                line.clear();
-                continue;
-            }
-        };
-        line.clear();
-
-        let role = match entry.get("type").and_then(|v| v.as_str()) {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
-            _ => continue,
-        };
-
-        if let Some(text) = extract_message_text(&entry) {
-            if role == "user" && is_system_content(text) {
-                continue;
-            }
-            messages.push(Message {
-                role: role.to_owned(),
-                text: text.to_owned(),
-            });
-        }
-    }
-
+/// Render search results: each matching message with one message of surrounding
+/// context on either side, the matched substring highlighted. Pure — operates
+/// entirely on already-read messages.
+fn render_search_preview(messages: &[Message], pattern: &str) -> String {
     let pattern_lower = pattern.to_lowercase();
     let mut output = String::new();
     let mut match_count = 0;
@@ -628,12 +555,12 @@ fn generate_search_preview(filepath: &PathBuf, pattern: &str) -> Result<String> 
         ));
     }
 
-    Ok(output)
+    output
 }
 
 /// Format a context message (dimmed, truncated if too long)
 fn format_context_message(msg: &Message) -> String {
-    let prefix = if msg.role == "user" { "U" } else { "A" };
+    let prefix = if msg.role == Role::User { "U" } else { "A" };
     const MAX_CONTEXT_LINES: usize = 10;
     let lines: Vec<&str> = msg.text.lines().collect();
 
@@ -665,10 +592,9 @@ fn format_context_message(msg: &Message) -> String {
 
 /// Format a matching message (colored, with highlights)
 fn format_matching_message(msg: &Message, pattern: &str) -> String {
-    let (prefix, color) = if msg.role == "user" {
-        ("U", colors::CYAN)
-    } else {
-        ("A", colors::YELLOW)
+    let (prefix, color) = match msg.role {
+        Role::User => ("U", colors::CYAN),
+        Role::Assistant => ("A", colors::YELLOW),
     };
 
     let pattern_lower = pattern.to_lowercase();
@@ -765,68 +691,89 @@ fn shell_escape(s: &str) -> String {
     s.replace("'", "'\\''")
 }
 
+/// A fully-resolved resume invocation, as data. Constructed by the pure
+/// [`build_resume_command`] so command/argument assembly — including remote
+/// shell escaping, which is security-sensitive — is unit-testable without
+/// spawning a process.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeCommand {
+    /// Run `claude -r <id> [--fork-session]` with cwd `dir`. No shell involved.
+    Local { dir: String, args: Vec<String> },
+    /// Run `ssh -t <target> <remote_cmd>`; `remote_cmd` is a shell string.
+    Remote { target: String, remote_cmd: String },
+}
+
+/// Build the resume/fork invocation for a session. Pure — no I/O.
+fn build_resume_command(session: &Session, fork: bool) -> ResumeCommand {
+    match &session.source {
+        SessionSource::Local => {
+            // Invoke claude directly — no shell, no escaping needed.
+            let mut args = vec!["-r".to_string(), session.id.clone()];
+            if fork {
+                args.push("--fork-session".to_string());
+            }
+            ResumeCommand::Local {
+                dir: session.project_path.clone(),
+                args,
+            }
+        }
+        SessionSource::Remote { host, user, .. } => {
+            let target = remote::format_ssh_target(host, user.as_deref());
+
+            // Remote requires a shell string — escape for safe single-quoting.
+            let fork_flag = if fork { " --fork-session" } else { "" };
+            let remote_cmd = format!(
+                "cd '{}' && claude -r '{}'{}",
+                shell_escape(&session.project_path),
+                shell_escape(&session.id),
+                fork_flag
+            );
+            ResumeCommand::Remote { target, remote_cmd }
+        }
+    }
+}
+
 /// Resume or fork a session, handling both local and remote sessions.
 fn resume_session(session: &Session, filepath: &std::path::Path, fork: bool) -> Result<()> {
     use std::process::Command;
 
     let action = if fork { "Forking" } else { "Resuming" };
-    let project_path = &session.project_path;
 
     // Validate project path
-    if project_path.is_empty() {
+    if session.project_path.is_empty() {
         eprintln!("Error: Session {} has no project path recorded", session.id);
         eprintln!("Session file: {}", filepath.display());
         anyhow::bail!("Cannot resume: no project path");
     }
 
-    let status = match &session.source {
-        SessionSource::Local => {
+    let status = match build_resume_command(session, fork) {
+        ResumeCommand::Local { dir, args } => {
             // Verify directory exists locally
-            if !std::path::Path::new(project_path).exists() {
-                eprintln!(
-                    "Error: Project directory no longer exists: {}",
-                    project_path
-                );
+            if !std::path::Path::new(&dir).exists() {
+                eprintln!("Error: Project directory no longer exists: {}", dir);
                 eprintln!("Session file: {}", filepath.display());
-                anyhow::bail!("Cannot resume: directory '{}' not found", project_path);
+                anyhow::bail!("Cannot resume: directory '{}' not found", dir);
             }
 
-            println!(
-                "{} session {} in {}",
-                action, session.id, session.project_path
-            );
+            println!("{} session {} in {}", action, session.id, dir);
 
-            // Invoke claude directly — no shell, no escaping needed
-            let mut cmd = Command::new("claude");
-            cmd.current_dir(project_path).args(["-r", &session.id]);
-            if fork {
-                cmd.arg("--fork-session");
-            }
-            cmd.status()?
+            Command::new("claude")
+                .current_dir(&dir)
+                .args(&args)
+                .status()?
         }
-        SessionSource::Remote { name, host, user } => {
-            let ssh_target = match user {
-                Some(u) => format!("{}@{}", u, host),
-                None => host.clone(),
-            };
-
+        ResumeCommand::Remote { target, remote_cmd } => {
             println!(
                 "{} remote session {} on {} in {}",
-                action, session.id, name, session.project_path
-            );
-
-            // Remote requires shell string — escape for safe single-quoting
-            let fork_flag = if fork { " --fork-session" } else { "" };
-            let claude_cmd = format!(
-                "cd '{}' && claude -r '{}'{}",
-                shell_escape(project_path),
-                shell_escape(&session.id),
-                fork_flag
+                action,
+                session.id,
+                session.source.display_name(),
+                session.project_path
             );
 
             // -t allocates a pseudo-TTY (required for claude's interactive mode)
             Command::new("ssh")
-                .args(["-t", &ssh_target, &claude_cmd])
+                .args(["-t", &target, &remote_cmd])
                 .status()?
         }
     };
@@ -856,7 +803,7 @@ fn build_fork_tree(sessions: &[Session]) -> std::collections::HashMap<&str, Vec<
     }
 
     for children in children_map.values_mut() {
-        children.sort_by(|a, b| b.modified.cmp(&a.modified));
+        children.sort_by_key(|s| std::cmp::Reverse(s.modified));
     }
 
     children_map
@@ -1696,5 +1643,129 @@ mod tests {
         let source = crate::session::SessionSource::Local;
         assert_eq!(source.display_name(), "local");
         assert!(source.is_local());
+    }
+
+    // =========================================================================
+    // Preview rendering (pure — no disk, operates on &[Message])
+    // =========================================================================
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn render_preview_empty_is_placeholder() {
+        assert_eq!(render_preview(&[]), "(empty session)");
+    }
+
+    #[test]
+    fn render_preview_uses_glyphs_and_first_line_only() {
+        let messages = [
+            msg(Role::User, "first line\nsecond line"),
+            msg(Role::Assistant, "reply"),
+        ];
+        let out = render_preview(&messages);
+        assert!(out.contains("U: first line"));
+        assert!(out.contains("A: reply"));
+        // Only the first line of a multi-line message is shown.
+        assert!(!out.contains("second line"));
+    }
+
+    #[test]
+    fn render_search_preview_highlights_match_with_context() {
+        let messages = [
+            msg(Role::User, "tell me about the api"),
+            msg(Role::Assistant, "the API is healthy"),
+            msg(Role::User, "thanks"),
+        ];
+        let out = render_search_preview(&messages, "healthy");
+        assert!(out.contains(colors::BOLD_INVERSE)); // highlighted match
+        assert!(out.contains("matching messages"));
+        // Surrounding context is included.
+        assert!(out.contains("tell me about the api"));
+    }
+
+    #[test]
+    fn render_search_preview_no_match() {
+        let messages = [msg(Role::User, "hello"), msg(Role::Assistant, "hi")];
+        let out = render_search_preview(&messages, "nonexistent");
+        assert!(out.contains("(no matches in transcript)"));
+    }
+
+    // =========================================================================
+    // Resume command construction (pure — security-sensitive escaping)
+    // =========================================================================
+
+    fn remote_session(id: &str, user: Option<&str>) -> Session {
+        Session {
+            source: SessionSource::Remote {
+                name: "devbox".to_string(),
+                host: "devbox.internal".to_string(),
+                user: user.map(str::to_string),
+            },
+            ..test_session(id)
+        }
+    }
+
+    #[test]
+    fn build_resume_command_local_no_fork() {
+        let session = test_session("abc");
+        assert_eq!(
+            build_resume_command(&session, false),
+            ResumeCommand::Local {
+                dir: "/tmp/test-project".to_string(),
+                args: vec!["-r".to_string(), "abc".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn build_resume_command_local_fork_appends_flag() {
+        let session = test_session("abc");
+        let ResumeCommand::Local { args, .. } = build_resume_command(&session, true) else {
+            panic!("expected local command");
+        };
+        assert_eq!(args, ["-r", "abc", "--fork-session"]);
+    }
+
+    #[test]
+    fn build_resume_command_remote_target_and_fork() {
+        let session = remote_session("xyz", Some("ec2-user"));
+        let ResumeCommand::Remote { target, remote_cmd } = build_resume_command(&session, true)
+        else {
+            panic!("expected remote command");
+        };
+        assert_eq!(target, "ec2-user@devbox.internal");
+        assert_eq!(
+            remote_cmd,
+            "cd '/tmp/test-project' && claude -r 'xyz' --fork-session"
+        );
+    }
+
+    #[test]
+    fn build_resume_command_remote_no_user_uses_bare_host() {
+        let session = remote_session("xyz", None);
+        let ResumeCommand::Remote { target, .. } = build_resume_command(&session, false) else {
+            panic!("expected remote command");
+        };
+        assert_eq!(target, "devbox.internal");
+    }
+
+    #[test]
+    fn build_resume_command_remote_escapes_single_quotes() {
+        // A project path containing a single quote must be safely escaped so it
+        // can't break out of the single-quoted shell argument.
+        let mut session = remote_session("s'id", None);
+        session.project_path = "/tmp/it's mine".to_string();
+        let ResumeCommand::Remote { remote_cmd, .. } = build_resume_command(&session, false) else {
+            panic!("expected remote command");
+        };
+        assert_eq!(
+            remote_cmd,
+            r#"cd '/tmp/it'\''s mine' && claude -r 's'\''id'"#
+        );
     }
 }
