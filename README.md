@@ -65,7 +65,7 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 - Use `--fork` to fork instead of resume (creates new session ID)
 - Use `--debug` to show session ID prefixes (useful for debugging)
 
-Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, source, project name, summary)
+Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, source, project name, label). The label is the first of: `/rename` name, `/tag`, compaction summary, auto-generated session title, first user message.
 
 ### List mode (`--list`)
 
@@ -103,7 +103,7 @@ forks nested under their parent sessions in interactive mode.
 Claude Code stores session data in `~/.claude/projects/`. This tool:
 
 1. Scans for `.jsonl` files with valid UUID filenames
-2. Extracts metadata directly from file contents (cwd, first message, summary, custom title)
+2. Extracts metadata directly from file contents (cwd, first message, summary, ai title, custom title)
 3. Uses filesystem timestamps for accurate sorting
 4. Filters out empty sessions and non-session files
 
