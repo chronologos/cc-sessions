@@ -68,6 +68,7 @@ flowchart LR
 
     subgraph "Other Entry Types"
         SUM[summary]
+        AIT[ai-title]
         CT[custom-title]
         SYS[system]
     end
@@ -84,9 +85,9 @@ All metadata is extracted directly from `.jsonl` files (no index dependency):
 
 1. **Walk** `~/.claude/projects/*/` for `.jsonl` files
 2. **Validate** filename is a UUID (8-4-4-4-12 hex format)
-3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, last `summary`/`custom-title`/`tag` entries, skip flags
+3. **Single-pass scan** collects: `cwd`, first `user` message, `forkedFrom`, turn count, last `summary`/`ai-title`/`custom-title`/`tag` entries, skip flags
 4. **Timestamps** from filesystem (created, modified)
-5. **Filter out** sidechain/teammate sessions and empty sessions (no cwd, no user message, no summary)
+5. **Filter out** sidechain/teammate sessions and empty sessions (no cwd, no user message, no summary). An `ai-title` alone does not qualify a session: background-agent stubs carry one with no conversation.
 
 Uses `rayon` for parallel processing across files.
 
@@ -105,7 +106,7 @@ All fields come from a single full-file pass with a reused line buffer. The firs
 (cwd, forkedFrom, isSidechain, teamName — stamped on every entry, so reliably
 present early). After that, a SIMD-accelerated byte scan (`memchr::memmem`) skips
 lines that don't mention a content-bearing `"type":` (user/assistant/summary/
-custom-title/tag), avoiding JSON parsing for the ~99% of lines that are
+ai-title/custom-title/tag), avoiding JSON parsing for the ~99% of lines that are
 progress/attachment chatter in long-running sessions.
 
 
@@ -115,12 +116,28 @@ progress/attachment chatter in long-running sessions.
 | `first_message` | First `user` entry passing filters | First occurrence |
 | `forked_from` | `forkedFrom.sessionId` field | First occurrence |
 | `summary` | `summary` type entry | Last well-formed occurrence |
+| `ai_title` | `ai-title` type entry | Last well-formed occurrence |
 | `name` (customTitle) | `custom-title` type entry | Last well-formed occurrence |
 | `tag` | `tag` type entry | Last occurrence; empty string clears |
 | `skip` | `isSidechain:true` or `teamName` present | Early return on match |
 | `created` / `modified` | Filesystem | `metadata.created()` / `.modified()` |
 
-Summary and custom-title entries can appear anywhere (compaction mid-session, `/rename` at any point), so last-wins is the correct semantic.
+Summary, ai-title, and custom-title entries can appear anywhere (compaction mid-session, retitling as the topic drifts, `/rename` at any point), so last-wins is the correct semantic.
+
+### Session Titles (aiTitle)
+
+Recent Claude Code versions auto-generate a session title and write it as
+`{"type":"ai-title","aiTitle":"...","sessionId":"..."}`, largely replacing the
+`summary` entry (a 400-session sample from a 2026 install had 96 sessions with an
+`ai-title` and none with a `summary`).
+
+It is also the only reliable label for a session opened via a slash command.
+`claude` stores such a prompt inside `<command-args>`, which
+`is_first_prompt_candidate` correctly rejects, so those sessions otherwise fall
+through to whatever unrelated message came next.
+
+`ai-title` is ranked below `summary` so that no existing row changes. In practice
+the two never co-occur, so the ordering only decides which fallback fires.
 
 **Entry-level skips** (processed for `cwd`/`forkedFrom` but excluded from first-prompt, turn count, and search text):
 - `isMeta:true` — synthetic messages (attachment context, proactive ticks)
@@ -250,13 +267,14 @@ Interactive mode displays a header with column legend:
 | MSG | Turn count (user messages, excludes system content) |
 | SOURCE | Session source (local, remote) |
 | PROJECT | Project directory name |
-| SUMMARY | `★ name` > `#tag` > summary > first message |
+| SUMMARY | `★ name` > `#tag` > summary > ai-title > first message |
 
 #### Turn Counting
 
 The MSG column shows actual user turns, filtering out system-generated content:
 - Entries with `isMeta:true` or `isCompactSummary:true`
-- Known system tag prefixes (`<command-...>`, `<local-command-...>`, `<bash-...>`, `<ide_...>`, `<tick>`, etc.) — but NOT arbitrary `<text>` like `<Button>`
+- Known system tag prefixes (`<command-...>`, `<local-command-...>`, `<bash-...>`, `<ide_...>`, `<tick>`, etc.), but NOT arbitrary `<text>` like `<Button>`
+- Relayed teammate messages, which the CLI prefixes with the prose line `Another Claude session sent a message:` before the `<teammate-message>` tag
 - `[...]` bracketed content
 - `/...` slash commands
 

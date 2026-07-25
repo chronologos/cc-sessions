@@ -214,7 +214,9 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
         return None;
     }
 
-    // Skip "empty" sessions that have no user content
+    // Skip "empty" sessions that have no user content. `ai_title` deliberately
+    // does not count: background-agent stubs carry one with no conversation at
+    // all, and listing those is what this filter exists to prevent.
     if scan.project_path.is_empty() && scan.first_prompt.is_none() && scan.summary.is_none() {
         return None;
     }
@@ -231,6 +233,7 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
         modified,
         first_message: scan.first_prompt,
         summary: scan.summary,
+        ai_title: scan.ai_title,
         name: scan.custom_title,
         tag: scan.tag,
         turn_count: scan.turn_count,
@@ -247,6 +250,7 @@ struct SessionScan {
     forked_from: Option<String>,
     turn_count: usize,
     summary: Option<String>,
+    ai_title: Option<String>,
     custom_title: Option<String>,
     tag: Option<String>,
     /// Session should be excluded from the picker (sidechain or swarm-teammate).
@@ -303,6 +307,12 @@ impl SessionScan {
             Some("summary") => {
                 if let Some(s) = entry.get("summary").and_then(|v| v.as_str()) {
                     self.summary = Some(s.to_owned());
+                }
+                return ControlFlow::Continue(());
+            }
+            Some("ai-title") => {
+                if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str()) {
+                    self.ai_title = Some(t.to_owned());
                 }
                 return ControlFlow::Continue(());
             }
@@ -492,7 +502,7 @@ fn line_mentions_content_type(line: &[u8]) -> bool {
         let after = &haystack[pos + needle_len..];
         let is_content = match after.first() {
             Some(&b'u') => after.starts_with(b"user\""),
-            Some(&b'a') => after.starts_with(b"assistant\""),
+            Some(&b'a') => after.starts_with(b"assistant\"") || after.starts_with(b"ai-title\""),
             Some(&b's') => after.starts_with(b"summary\""),
             Some(&b'c') => after.starts_with(b"custom-title\""),
             Some(&b't') => after.starts_with(b"tag\""),
@@ -1187,6 +1197,69 @@ mod tests {
 {"type":"summary"}"#,
         );
         assert_eq!(scan.summary, Some("Valid".to_string()));
+    }
+
+    #[test]
+    fn scan_takes_last_ai_title() {
+        let scan = scan(
+            r#"{"type":"ai-title","aiTitle":"Early guess","sessionId":"x"}
+{"type":"user","message":{"role":"user","content":"more work"},"cwd":"/tmp"}
+{"type":"ai-title","aiTitle":"Claude Science research team findings","sessionId":"x"}"#,
+        );
+        assert_eq!(
+            scan.ai_title,
+            Some("Claude Science research team findings".to_string())
+        );
+    }
+
+    /// `ai-title` entries land well past `HEADER_SCAN_LINES`, so the byte-level
+    /// prefilter must recognise them or they are never parsed.
+    #[test]
+    fn scan_finds_ai_title_past_header_window() {
+        let mut content = String::new();
+        for i in 0..(HEADER_SCAN_LINES + 10) {
+            content.push_str(&format!(
+                r#"{{"type":"progress","step":{i},"cwd":"/tmp"}}
+"#
+            ));
+        }
+        content.push_str(r#"{"type":"ai-title","aiTitle":"Late title","sessionId":"x"}"#);
+
+        let scan = scan(&content);
+        assert_eq!(scan.ai_title, Some("Late title".to_string()));
+    }
+
+    /// An ai-title alone must not resurrect a contentless session: background
+    /// agents write a title (and nothing else) into otherwise empty transcripts.
+    #[test]
+    fn ai_title_alone_does_not_qualify_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("bd33d65e-a540-44ea-ac09-b4f46f8d035e.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"ai-title","aiTitle":"resume-background-agent","sessionId":"bd33d65e"}
+{"type":"agent-name","agentName":"resume-background-agent","sessionId":"bd33d65e"}"#,
+        )
+        .unwrap();
+
+        assert!(extract_session_metadata(path, &SessionSource::Local).is_none());
+    }
+
+    /// A session whose only real prompt arrived via `/slash-command` args has no
+    /// usable first message, but its ai-title still identifies it.
+    #[test]
+    fn ai_title_survives_slash_command_only_session() {
+        let scan = scan(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<command-name>/orchestrate</command-name>"}]},"cwd":"/tmp"}
+{"type":"ai-title","aiTitle":"Deep research on Claude Science","sessionId":"x"}"#,
+        );
+        assert_eq!(scan.first_prompt, None);
+        assert_eq!(
+            scan.ai_title,
+            Some("Deep research on Claude Science".to_string())
+        );
     }
 
     #[test]
