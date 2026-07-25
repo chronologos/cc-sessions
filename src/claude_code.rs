@@ -311,7 +311,11 @@ impl SessionScan {
                 return ControlFlow::Continue(());
             }
             Some("ai-title") => {
-                if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str()) {
+                // Empty title would blank the row and mask the first message,
+                // so it is treated as absent rather than as a label.
+                if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str())
+                    && !t.is_empty()
+                {
                     self.ai_title = Some(t.to_owned());
                 }
                 return ControlFlow::Continue(());
@@ -1227,6 +1231,15 @@ mod tests {
 
         let scan = scan(&content);
         assert_eq!(scan.ai_title, Some("Late title".to_string()));
+    }
+
+    #[test]
+    fn scan_ignores_blank_ai_title() {
+        let scan = scan(
+            r#"{"type":"ai-title","aiTitle":"Real title","sessionId":"x"}
+{"type":"ai-title","aiTitle":"","sessionId":"x"}"#,
+        );
+        assert_eq!(scan.ai_title, Some("Real title".to_string()));
     }
 
     /// An ai-title alone must not resurrect a contentless session: background
