@@ -16,8 +16,20 @@ const SYSTEM_TAG_PREFIXES: &[&str] = &[
     "<ultraplan-mode>",
 ];
 
+/// Prose preamble the CLI prepends to a relayed teammate message before the
+/// `<teammate-message>` tag itself, so the tag is no longer at position 0.
+const TEAMMATE_RELAY_PREAMBLE: &str = "Another Claude session sent a message:";
+
 pub fn starts_with_system_tag(text: &str) -> bool {
-    SYSTEM_TAG_PREFIXES.iter().any(|p| text.starts_with(p))
+    SYSTEM_TAG_PREFIXES.iter().any(|p| text.starts_with(p)) || is_teammate_relay(text)
+}
+
+/// Whether a text is a relayed teammate message wrapped in the CLI's prose
+/// preamble. Requires the actual `<teammate-message` tag to follow, so a human
+/// quoting that sentence is not misclassified.
+fn is_teammate_relay(text: &str) -> bool {
+    text.strip_prefix(TEAMMATE_RELAY_PREAMBLE)
+        .is_some_and(|rest| rest.trim_start().starts_with("<teammate-message"))
 }
 
 /// Whether a user-message text payload should be hidden in transcript previews.
@@ -122,6 +134,19 @@ mod tests {
         assert!(!is_first_prompt_candidate("<tick>"));
         assert!(!is_first_prompt_candidate("[Request interrupted by user]"));
         assert!(is_first_prompt_candidate("[not a request interrupt]"));
+    }
+
+    #[test]
+    fn teammate_relay_preamble_is_system_content() {
+        let relayed = "Another Claude session sent a message:\n<teammate-message teammate_id=\"a\">hi</teammate-message>";
+        assert!(starts_with_system_tag(relayed));
+        assert!(!is_first_prompt_candidate(relayed));
+        assert!(!counts_as_turn(relayed));
+
+        // The preamble alone, without the tag, is plausible user prose: keep it.
+        assert!(is_first_prompt_candidate(
+            "Another Claude session sent a message: can you check what it meant?"
+        ));
     }
 
     #[test]

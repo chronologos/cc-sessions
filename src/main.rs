@@ -324,8 +324,10 @@ fn format_time_relative(time: SystemTime) -> String {
     }
 }
 
-/// Format session description: name (★) > tag (#) > summary > first_message
+/// Format session description: name (★) > tag (#) > summary > ai_title > first_message
 fn format_session_desc(session: &Session, max_chars: usize) -> String {
+    let topic = session.summary.as_deref().or(session.ai_title.as_deref());
+
     let label = match (&session.name, &session.tag) {
         (Some(name), Some(tag)) => Some(format!("★ {} #{}", name, tag)),
         (Some(name), None) => Some(format!("★ {}", name)),
@@ -338,23 +340,21 @@ fn format_session_desc(session: &Session, max_chars: usize) -> String {
         if label_len >= max_chars {
             return label.chars().take(max_chars).collect();
         }
-        // Append summary if there's room for " - " + at least 10 chars
-        if let Some(summary) = &session.summary
+        // Append topic if there's room for " - " + at least 10 chars
+        if let Some(topic) = topic
             && max_chars > label_len + 13
         {
             let remaining = max_chars - label_len - 3;
             return format!(
                 "{} - {}",
                 label,
-                summary.chars().take(remaining).collect::<String>()
+                topic.chars().take(remaining).collect::<String>()
             );
         }
         return label;
     }
 
-    session
-        .summary
-        .as_deref()
+    topic
         .or(session.first_message.as_deref())
         .map(|s| s.chars().take(max_chars).collect())
         .unwrap_or_default()
@@ -1304,12 +1304,41 @@ mod tests {
             modified: SystemTime::now(),
             first_message: None,
             summary: Some("test summary".to_string()),
+            ai_title: None,
             name: None,
             tag: None,
             turn_count: 1,
             source: SessionSource::Local,
             forked_from: None,
         }
+    }
+
+    #[test]
+    fn desc_falls_back_to_ai_title_before_first_message() {
+        let mut session = test_session("s");
+        session.summary = None;
+        session.ai_title = Some("Claude Science research".to_string());
+        session.first_message = Some("Another Claude session sent a".to_string());
+
+        assert_eq!(format_session_desc(&session, 50), "Claude Science research");
+    }
+
+    #[test]
+    fn desc_prefers_summary_over_ai_title() {
+        let mut session = test_session("s");
+        session.ai_title = Some("ai title".to_string());
+
+        assert_eq!(format_session_desc(&session, 50), "test summary");
+    }
+
+    #[test]
+    fn desc_appends_ai_title_to_name_label() {
+        let mut session = test_session("s");
+        session.summary = None;
+        session.ai_title = Some("ai title".to_string());
+        session.name = Some("pinned".to_string());
+
+        assert_eq!(format_session_desc(&session, 50), "★ pinned - ai title");
     }
 
     #[test]
