@@ -1,3 +1,5 @@
+
+
 # cc-sessions
 
 Claude Code's `/resume` only shows sessions for your current project, on your current machine. If you work across multiple codebases, finding that session from 3 days ago means remembering which repo you were in.
@@ -31,7 +33,7 @@ chmod +x ~/.local/bin/cc-sessions
 
 ### Build from source
 
-Requires Rust 1.85+ (edition 2024) and [just](https://github.com/casey/just).
+Requires Rust 1.88+ (edition 2024) and [just](https://github.com/casey/just).
 
 ```bash
 just install  # Build and install to ~/.local/bin (macOS signing handled automatically)
