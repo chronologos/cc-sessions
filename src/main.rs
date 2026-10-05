@@ -818,40 +818,47 @@ fn build_subtree_header(
     session_by_id: &std::collections::HashMap<&str, &Session>,
     debug: bool,
 ) -> String {
-    // When searching, show esc to clear; otherwise show navigation hints
-    let (nav_hint, focus_info) = if search_pattern.is_some() {
-        ("esc to clear", String::new())
-    } else {
-        let hint = if focus.is_some() {
-            "← back"
-        } else {
-            "→ into forks"
-        };
-        let info = focus
-            .and_then(|id| session_by_id.get(id))
-            .map(|s| format!(" [{}]", format_session_desc(s, 30)))
-            .unwrap_or_default();
-        (hint, info)
-    };
+    let focus_info = focus
+        .filter(|_| search_pattern.is_none())
+        .and_then(|id| session_by_id.get(id))
+        .map(|s| format!(" │ in [{}]", format_session_desc(s, 30)))
+        .unwrap_or_default();
 
-    let status_line = match (search_pattern, search_count, fork) {
-        (Some(pat), Some(count), true) => {
-            format!(
-                "FORK │ search: \"{}\" ({} matches) │ {}",
-                pat, count, nav_hint
-            )
-        }
-        (Some(pat), Some(count), false) => {
-            format!("search: \"{}\" ({} matches) │ {}", pat, count, nav_hint)
-        }
-        (Some(pat), None, true) => format!("FORK │ search: \"{}\" │ {}", pat, nav_hint),
-        (Some(pat), None, false) => format!("search: \"{}\" │ {}", pat, nav_hint),
-        (None, _, true) => format!("FORK mode │ {}{}", nav_hint, focus_info),
-        (None, _, false) => format!("Select session │ {}{}", nav_hint, focus_info),
+    let mode = if fork { "FORK mode" } else { "Select session" };
+    let status_line = match (search_pattern, search_count) {
+        (Some(pat), Some(count)) => format!("{} │ search: \"{}\" ({} matches)", mode, pat, count),
+        (Some(pat), None) => format!("{} │ search: \"{}\"", mode, pat),
+        (None, _) => format!("{}{}", mode, focus_info),
     };
 
     let legend = build_column_legend(debug);
-    format!("{}\n{}", status_line, legend)
+    let keys = build_key_hints(search_pattern.is_some(), focus.is_some(), fork);
+    format!("{}\n{}\n{}", status_line, legend, keys)
+}
+
+/// Shortcut line shown under the column legend. Only lists keys that do
+/// something in the current view (←/→ are inert while searching).
+fn build_key_hints(searching: bool, focused: bool, fork: bool) -> String {
+    let enter = if fork { "enter fork" } else { "enter resume" };
+    let keys: &[&str] = match (searching, focused) {
+        (true, _) => &[enter, "alt+p preview", "esc clear search"],
+        // Kept short: the header shares the list pane (~half the terminal).
+        (false, true) => &[
+            enter,
+            "→/← forks",
+            "ctrl+s search",
+            "alt+p preview",
+            "esc root",
+        ],
+        (false, false) => &[
+            enter,
+            "→ forks",
+            "ctrl+s search",
+            "alt+p preview",
+            "esc quit",
+        ],
+    };
+    format!("  {}", keys.join(" · "))
 }
 
 /// Width (in columns) consumed by the fixed fields before SUMMARY:
@@ -983,11 +990,11 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
     let mut state = InteractiveState::default();
 
     loop {
-        // Re-query each loop so terminal resizes between skim invocations are
-        // picked up. Preview pane is configured as right:50%, so the list pane
-        // gets roughly the other half.
+        // Rows are built for the full terminal width (preview hidden) and
+        // clipped to the live list-pane width in `SessionItem::display`, so
+        // toggling the preview or resizing reflows without restarting skim.
         let (term_w, _) = crossterm::terminal::size().unwrap_or((160, 40));
-        let desc_width = desc_budget(term_w / 2, debug);
+        let desc_width = desc_budget(term_w, debug);
 
         let focus = state.focus().map(String::as_str);
         let visible_sessions = visible_sessions_for_view(
@@ -1017,6 +1024,9 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             .prompt("filter> ")
             .reverse(false)
             .no_sort(true)
+            // Rows are pre-fitted to the pane; hscroll would shift a row
+            // sideways to chase a match in its clipped tail.
+            .no_hscroll(true)
             .bind(vec![
                 // Tagged accepts: skim 5 overwrites `final_key` with synthetic
                 // events (change/focus/...), so the tag is the only reliable
@@ -1150,7 +1160,13 @@ impl SkimItem for SessionItem {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD);
         }
-        context.to_line(Cow::Borrowed(&self.display))
+        let width = context.container_width;
+        if self.display.chars().count() <= width {
+            return context.to_line(Cow::Borrowed(&self.display));
+        }
+        let (clipped, matches) = clip_to_width(&self.display, &context.matches, width);
+        context.matches = matches;
+        context.to_line(Cow::Borrowed(clipped))
     }
 
     fn output(&self) -> Cow<'_, str> {
@@ -1167,6 +1183,30 @@ impl SkimItem for SessionItem {
             Err(_) => ItemPreview::Text("(failed to load preview)".to_string()),
         }
     }
+}
+
+/// Clip `text` to `width` chars and drop/trim match highlights that fall in
+/// the clipped tail (skim's `to_line` would otherwise emit NUL spans for
+/// out-of-range char indices and panic on out-of-range byte ranges).
+fn clip_to_width<'a>(text: &'a str, matches: &Matches, width: usize) -> (&'a str, Matches) {
+    let end = text
+        .char_indices()
+        .nth(width)
+        .map_or(text.len(), |(i, _)| i);
+    let clipped = &text[..end];
+    let matches = match matches {
+        Matches::CharIndices(idx) => {
+            Matches::CharIndices(idx.iter().copied().filter(|&i| i < width).collect())
+        }
+        Matches::CharRange(start, stop) if *start < width => {
+            Matches::CharRange(*start, (*stop).min(width))
+        }
+        Matches::ByteRange(start, stop) if *start < end => {
+            Matches::ByteRange(*start, (*stop).min(end))
+        }
+        _ => Matches::None,
+    };
+    (clipped, matches)
 }
 
 // =============================================================================
@@ -1395,9 +1435,12 @@ mod tests {
         let session_by_id: HashMap<&str, &Session> = HashMap::new();
 
         let header = build_subtree_header(None, None, false, None, &session_by_id, false);
-        assert!(header.contains("Select session"));
-        assert!(header.contains("→ into forks"));
-        assert!(header.contains("CRE")); // Legend line
+        let lines: Vec<&str> = header.lines().collect();
+        assert!(lines[0].contains("Select session"));
+        assert!(lines[1].contains("CRE")); // Legend line
+        // Shortcuts sit below the column titles
+        assert!(lines[2].contains("→ forks"));
+        assert!(lines[2].contains("esc quit"));
     }
 
     #[test]
@@ -1417,7 +1460,9 @@ mod tests {
         let header = build_subtree_header(Some("api"), Some(5), false, None, &session_by_id, false);
         assert!(header.contains("search: \"api\""));
         assert!(header.contains("(5 matches)"));
-        assert!(header.contains("esc to clear"));
+        assert!(header.contains("esc clear search"));
+        // ←/→ are inert while searching, so don't advertise them
+        assert!(!header.contains("→ forks"));
     }
 
     #[test]
@@ -1429,8 +1474,38 @@ mod tests {
 
         let header =
             build_subtree_header(None, None, false, Some("focused"), &session_by_id, false);
-        assert!(header.contains("← back"));
-        assert!(!header.contains("→ into forks"));
+        assert!(header.contains("→/← forks"));
+        assert!(header.contains("esc root"));
+        assert!(header.contains("in [test summary]"));
+    }
+
+    #[test]
+    fn key_hints_fork_mode_says_fork() {
+        assert!(build_key_hints(false, false, true).contains("enter fork"));
+        assert!(build_key_hints(false, false, false).contains("enter resume"));
+    }
+
+    // =========================================================================
+    // Row clipping (preview toggle reflow)
+    // =========================================================================
+
+    #[test]
+    fn clip_to_width_drops_highlights_past_the_edge() {
+        let (text, m) = clip_to_width("héllo world", &Matches::CharIndices(vec![1, 4, 8]), 5);
+        assert_eq!(text, "héllo");
+        assert!(matches!(m, Matches::CharIndices(ref v) if v == &vec![1, 4]));
+    }
+
+    #[test]
+    fn clip_to_width_trims_ranges() {
+        let (_, m) = clip_to_width("abcdefgh", &Matches::CharRange(3, 7), 5);
+        assert!(matches!(m, Matches::CharRange(3, 5)));
+        let (_, m) = clip_to_width("abcdefgh", &Matches::CharRange(6, 7), 5);
+        assert!(matches!(m, Matches::None));
+        // Byte range clamps to a char boundary ("é" is 2 bytes)
+        let (text, m) = clip_to_width("héllo world", &Matches::ByteRange(1, 9), 3);
+        assert_eq!(text, "hél");
+        assert!(matches!(m, Matches::ByteRange(1, 4)));
     }
 
     // =========================================================================

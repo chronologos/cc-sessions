@@ -55,7 +55,7 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 *Preview, transcript search, and fork navigation are **interactive-only**; they are not available in list mode.*
 
 - **Fuzzy search** through project names and summaries
-- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes; **alt+p** toggles it (resets to shown on view change)
+- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes; **alt+p** toggles it and the list reflows to the freed width (preview comes back on view change)
 - **ctrl+s** for full-text transcript search — replaces view with matching sessions, esc clears
 - **Enter** to resume session in the original project directory
 - **esc** clears search first, then goes to root view, then exits
@@ -65,7 +65,7 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 - Use `--fork` to fork instead of resume (creates new session ID)
 - Use `--debug` to show session ID prefixes (useful for debugging)
 
-Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, source, project name, summary)
+Column layout: `CRE MOD MSG SOURCE PROJECT SUMMARY` (timestamps, message count, source, project name, summary), with the shortcuts for the current view listed underneath
 
 ### List mode (`--list`)
 

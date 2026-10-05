@@ -52,11 +52,17 @@ pub fn classify_user_text_for_metrics(text: &str) -> MessageKind {
         return MessageKind::SystemTag;
     }
 
-    if text.starts_with('[') {
+    // `[Image #1] ...` / `[Pasted text #1 ...]` are the CLI's placeholders
+    // for attachments in a typed prompt, not bracketed system output.
+    if text.starts_with('[') && !is_attachment_placeholder(text) {
         return MessageKind::BracketedOutput;
     }
 
     MessageKind::UserContent
+}
+
+fn is_attachment_placeholder(text: &str) -> bool {
+    text.starts_with("[Image #") || text.starts_with("[Pasted text #")
 }
 
 /// Whether a user text should count as a conversation turn.
@@ -96,6 +102,11 @@ mod tests {
             ("<bash-input>ls</bash-input>", MessageKind::SystemTag),
             ("<tick>", MessageKind::SystemTag),
             ("[local command output]", MessageKind::BracketedOutput),
+            ("[Image #1] what is this", MessageKind::UserContent),
+            (
+                "[Pasted text #2 +40 lines] fix it",
+                MessageKind::UserContent,
+            ),
             ("", MessageKind::Empty),
             // Real user input starting with < should NOT be classified as system
             ("<Button> component is broken", MessageKind::UserContent),

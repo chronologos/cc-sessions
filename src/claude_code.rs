@@ -230,7 +230,12 @@ fn extract_session_metadata(filepath: PathBuf, source: &SessionSource) -> Option
         created,
         modified,
         first_message: scan.first_prompt,
-        summary: scan.summary,
+        // Legacy `summary` entries no longer appear, so the auto title fills
+        // that slot — but only for unnamed sessions: alongside a /rename name
+        // it just echoes it (e.g. "money" → "money ⑂").
+        summary: scan
+            .summary
+            .or(scan.ai_title.filter(|_| scan.custom_title.is_none())),
         name: scan.custom_title,
         tag: scan.tag,
         turn_count: scan.turn_count,
@@ -248,6 +253,7 @@ struct SessionScan {
     turn_count: usize,
     summary: Option<String>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
     tag: Option<String>,
     /// Session should be excluded from the picker (sidechain or swarm-teammate).
     skip: bool,
@@ -306,6 +312,13 @@ impl SessionScan {
                 }
                 return ControlFlow::Continue(());
             }
+            // Auto-generated title (Claude Code 2.1.236+), last wins.
+            Some("ai-title") => {
+                if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str()) {
+                    self.ai_title = Some(t.to_owned());
+                }
+                return ControlFlow::Continue(());
+            }
             Some("custom-title") => {
                 if let Some(t) = entry.get("customTitle").and_then(|v| v.as_str()) {
                     self.custom_title = Some(t.to_owned());
@@ -358,6 +371,22 @@ impl SessionScan {
     }
 }
 
+/// Line prefix of bulk entries that carry nothing we read: raw API request
+/// payloads (`api-request`, `-blob`, `-shape`), ~60% of transcript bytes since
+/// Claude Code 2.1.284. The byte prefilter would reject them anyway, but only
+/// after `read_line` has copied and UTF-8-validated the whole line.
+const BULK_LINE_PREFIX: &[u8] = br#"{"type":"api-request"#;
+
+/// If the reader is positioned at a bulk line, consume it without copying and
+/// return true. A line whose start straddles the buffer edge is just read
+/// normally (correct, merely slower).
+fn skip_bulk_line(reader: &mut impl BufRead) -> bool {
+    match reader.fill_buf() {
+        Ok(buf) if buf.starts_with(BULK_LINE_PREFIX) => reader.skip_until(b'\n').is_ok(),
+        _ => false,
+    }
+}
+
 /// Scan transcript content from any buffered reader.
 ///
 /// This is the single production drive loop (line numbering, one reused line
@@ -369,6 +398,10 @@ fn scan_from_reader(mut reader: impl BufRead) -> SessionScan {
     let mut line_no = 0usize;
 
     loop {
+        if skip_bulk_line(&mut reader) {
+            line_no += 1;
+            continue;
+        }
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => break,
@@ -460,7 +493,13 @@ fn search_text_from_reader(mut reader: impl BufRead) -> String {
     let mut line = String::new();
     let mut out = String::new();
 
-    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+    loop {
+        if skip_bulk_line(&mut reader) {
+            continue;
+        }
+        if !reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+            break;
+        }
         ingest_search_line(&mut out, &line);
         line.clear();
     }
@@ -492,7 +531,7 @@ fn line_mentions_content_type(line: &[u8]) -> bool {
         let after = &haystack[pos + needle_len..];
         let is_content = match after.first() {
             Some(&b'u') => after.starts_with(b"user\""),
-            Some(&b'a') => after.starts_with(b"assistant\""),
+            Some(&b'a') => after.starts_with(b"assistant\"") || after.starts_with(b"ai-title\""),
             Some(&b's') => after.starts_with(b"summary\""),
             Some(&b'c') => after.starts_with(b"custom-title\""),
             Some(&b't') => after.starts_with(b"tag\""),
@@ -630,8 +669,14 @@ pub fn read_messages_from_reader(
     let mut messages = Vec::new();
     let mut line = String::new();
 
-    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+    loop {
         if limit.is_some_and(|lim| messages.len() >= lim) {
+            break;
+        }
+        if skip_bulk_line(&mut reader) {
+            continue;
+        }
+        if !reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
             break;
         }
         ingest_message_line(&mut messages, &line, detail);
@@ -903,6 +948,23 @@ mod tests {
         let sessions = find_sessions(&root).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, Some("Important Session".to_string()));
+    }
+
+    #[test]
+    fn find_sessions_ai_title_only_labels_unnamed_sessions() {
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"hi"},"cwd":"/tmp"}"#;
+        let ai = r#"{"type":"ai-title","aiTitle":"Auto Title","sessionId":"x"}"#;
+        let named = r#"{"type":"custom-title","customTitle":"Mine","sessionId":"x"}"#;
+
+        let (_tmp, root) = project_fixture("-tmp", &test_uuid(1), &format!("{prompt}\n{ai}"));
+        let sessions = find_sessions(&root).unwrap();
+        assert_eq!(sessions[0].summary, Some("Auto Title".to_string()));
+
+        let (_tmp, root) =
+            project_fixture("-tmp", &test_uuid(2), &format!("{prompt}\n{ai}\n{named}"));
+        let sessions = find_sessions(&root).unwrap();
+        assert_eq!(sessions[0].name, Some("Mine".to_string()));
+        assert_eq!(sessions[0].summary, None);
     }
 
     #[test]
@@ -1187,6 +1249,49 @@ mod tests {
 {"type":"summary"}"#,
         );
         assert_eq!(scan.summary, Some("Valid".to_string()));
+    }
+
+    #[test]
+    fn scan_takes_last_ai_title() {
+        let scan = scan(
+            r#"{"type":"ai-title","aiTitle":"First guess","sessionId":"x"}
+{"type":"user","message":{"role":"user","content":"hello"},"cwd":"/tmp"}
+{"type":"ai-title","aiTitle":"Better title","sessionId":"x"}"#,
+        );
+        assert_eq!(scan.ai_title, Some("Better title".to_string()));
+    }
+
+    /// A bulk api-request line, with a nested `"type":"user"` that would
+    /// fool the byte prefilter if the line were ever parsed.
+    const BULK: &str = r#"{"type":"api-request","params":{"messages":[{"type":"user","message":{"role":"user","content":"LEAKED"}}]}}"#;
+
+    #[test]
+    fn bulk_lines_are_skipped_but_still_counted() {
+        // 20 bulk lines push the real entries past the header window, so the
+        // byte prefilter must still engage for them (line numbering intact).
+        let mut content = format!("{BULK}\n").repeat(20);
+        content.push_str(
+            r#"{"type":"user","message":{"role":"user","content":"real prompt"},"cwd":"/tmp"}"#,
+        );
+        let s = scan(&content);
+        assert_eq!(s.first_prompt, Some("real prompt".to_string()));
+        assert_eq!(s.project_path, "/tmp");
+        assert_eq!(s.turn_count, 1);
+        assert!(!search_text_from_str(&content).contains("leaked"));
+        let msgs = read_messages_from_reader(content.as_bytes(), None, TextDetail::Full);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn bulk_line_straddling_buffer_edge_reads_normally() {
+        // Tiny buffer: the prefix check can't see the whole marker, so the
+        // line takes the normal read path and is rejected by the prefilter.
+        let content = format!(
+            "{BULK}\n{}",
+            r#"{"type":"user","message":{"role":"user","content":"after"},"cwd":"/tmp"}"#
+        );
+        let s = scan_from_reader(std::io::BufReader::with_capacity(4, content.as_bytes()));
+        assert_eq!(s.first_prompt, Some("after".to_string()));
     }
 
     #[test]

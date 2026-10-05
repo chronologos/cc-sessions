@@ -114,11 +114,15 @@ progress/attachment chatter in long-running sessions.
 | `project_path` | `cwd` field | First occurrence |
 | `first_message` | First `user` entry passing filters | First occurrence |
 | `forked_from` | `forkedFrom.sessionId` field | First occurrence |
-| `summary` | `summary` type entry | Last well-formed occurrence |
+| `summary` | `summary` type entry (legacy, absent since ~mid-2026), else `ai-title` for unnamed sessions | Last well-formed occurrence |
 | `name` (customTitle) | `custom-title` type entry | Last well-formed occurrence |
 | `tag` | `tag` type entry | Last occurrence; empty string clears |
 | `skip` | `isSidechain:true` or `teamName` present | Early return on match |
 | `created` / `modified` | Filesystem | `metadata.created()` / `.modified()` |
+
+Lines starting `{"type":"api-request` (raw API payloads, ~60% of transcript bytes since CC 2.1.284) are skipped in the reader via `skip_bulk_line` — consumed with `skip_until` without copying or UTF-8 validation — in discovery, search-index and preview loops alike.
+
+`ai-title` (CC 2.1.236+) is an auto-generated title; with a custom title present it just echoes it (e.g. `money ⑂`), so it's only used when there is no custom title. `[Image #N]` / `[Pasted text #N]` prompts count as turns.
 
 Summary and custom-title entries can appear anywhere (compaction mid-session, `/rename` at any point), so last-wins is the correct semantic.
 
@@ -251,6 +255,12 @@ Interactive mode displays a header with column legend:
 | SOURCE | Session source (local, remote) |
 | PROJECT | Project directory name |
 | SUMMARY | `★ name` > `#tag` > summary > first message |
+
+A third header line lists the shortcuts valid in the current view (`build_key_hints`).
+
+Rows are formatted once for the **full** terminal width and clipped to skim's live `container_width` in `SessionItem::display` (`clip_to_width` also trims match highlights). This is what makes `alt+p` (skim's built-in `toggle-preview`) reflow the SUMMARY column without restarting skim; `no_hscroll` keeps rows from shifting to chase matches in the clipped tail. Fuzzy matching therefore covers the full-width summary, including text hidden behind the preview.
+
+Keys that end a skim run use tagged binds (`accept(ctrl-s)`, `accept(left)`, `accept(right)`) and are dispatched on `final_event`. Don't use `final_key`: skim 5 overwrites it with synthetic events (change/focus), so it can read as Enter.
 
 #### Turn Counting
 
