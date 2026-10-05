@@ -960,7 +960,6 @@ fn visible_sessions_for_view<'a>(
 }
 
 fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()> {
-    use crossterm::event::{KeyCode, KeyModifiers};
     use std::collections::HashMap;
 
     let session_by_id: HashMap<&str, &Session> =
@@ -1019,9 +1018,14 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             .reverse(false)
             .no_sort(true)
             .bind(vec![
-                "ctrl-s:accept".to_string(),
-                "right:accept".to_string(),
-                "left:accept".to_string(),
+                // Tagged accepts: skim 5 overwrites `final_key` with synthetic
+                // events (change/focus/...), so the tag is the only reliable
+                // way to tell which key ended the run.
+                "ctrl-s:accept(ctrl-s)".to_string(),
+                "right:accept(right)".to_string(),
+                "left:accept(left)".to_string(),
+                // Handled inside skim (not via accept) so query and cursor survive
+                "alt-p:toggle-preview".to_string(),
             ])
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build skim options: {}", e))?;
@@ -1060,9 +1064,12 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             }
         }
 
-        let key = (out.final_key.code, out.final_key.modifiers);
+        let accept_tag = match &out.final_event {
+            Event::Action(Action::Accept(tag)) => tag.as_deref(),
+            _ => None,
+        };
 
-        if key == (KeyCode::Char('s'), KeyModifiers::CONTROL) {
+        if accept_tag == Some("ctrl-s") {
             let effect = state.apply(StateAction::CtrlS {
                 query: out.query.to_string(),
             });
@@ -1091,7 +1098,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
             continue;
         }
 
-        if key.0 == KeyCode::Right {
+        if accept_tag == Some("right") {
             let selected_id = out.selected_items.first().map(|m| m.output().to_string());
             let has_children = selected_id
                 .as_deref()
@@ -1105,7 +1112,7 @@ fn interactive_mode(sessions: &[Session], fork: bool, debug: bool) -> Result<()>
         }
 
         // Left: pop stack
-        if key.0 == KeyCode::Left {
+        if accept_tag == Some("left") {
             let _ = state.apply(StateAction::Left);
             continue;
         }

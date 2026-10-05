@@ -55,7 +55,7 @@ cc-sessions --list --include-forks  # List mode including forked sessions
 *Preview, transcript search, and fork navigation are **interactive-only**; they are not available in list mode.*
 
 - **Fuzzy search** through project names and summaries
-- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes
+- **Preview pane** shows conversation transcript with color-coded user (cyan) / assistant (yellow) prefixes; **alt+p** toggles it (resets to shown on view change)
 - **ctrl+s** for full-text transcript search — replaces view with matching sessions, esc clears
 - **Enter** to resume session in the original project directory
 - **esc** clears search first, then goes to root view, then exits
